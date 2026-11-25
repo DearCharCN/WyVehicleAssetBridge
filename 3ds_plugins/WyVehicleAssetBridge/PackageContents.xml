@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ApplicationPackage SchemaVersion="1.0"
+                    AutodeskProduct="3ds Max"
+                    ProductType="Application"
+                    Name="WY Vehicle Asset Bridge"
+                    Description="Native 3ds Max foundation for vehicle asset exchange with Unreal Engine."
+                    AppVersion="0.1.0"
+                    UpgradeCode="{C553E194-75B6-46A1-B101-4FADAE654D85}"
+                    ProductCode="{8EE8C717-EE61-43BB-AB4E-9238067D8B7B}">
+    <CompanyDetails Name="WY Vehicle Tools" />
+    <Components Description="plugins parts">
+        <RuntimeRequirements OS="Win64" Platform="3ds Max" SeriesMin="2025" SeriesMax="2025" />
+        <ComponentEntry ModuleName="./Contents/Win64/WyVehicleAssetBridge.gup" />
+    </Components>
+</ApplicationPackage>

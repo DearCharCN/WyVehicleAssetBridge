@@ -1,0 +1,19 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "WY Vehicle Asset Bridge",
+  "Description": "Editor foundation for vehicle asset exchange between 3ds Max and Unreal Engine.",
+  "Category": "Editor",
+  "CreatedBy": "WY Vehicle Tools",
+  "CanContainContent": false,
+  "EnabledByDefault": true,
+  "IsBetaVersion": true,
+  "Modules": [
+    {
+      "Name": "WyVehicleAssetBridge",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ]
+}

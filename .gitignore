@@ -1,0 +1,17 @@
+# Latest artifacts, temporary build trees, logs and caches (at any depth).
+/3ds_plugins/**/build/
+/ue_plugins/**/build/
+**/Binaries/
+**/Intermediate/
+**/Saved/
+.vs/
+.idea/
+.vscode/
+*.sln
+*.vcxproj*
+*.suo
+*.user
+*.pdb
+/build_and_deploy.local.ini
+/build_and_deploy.ini
+/.build.lock
