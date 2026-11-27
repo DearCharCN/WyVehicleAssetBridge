@@ -3,7 +3,7 @@
   "Version": 1,
   "VersionName": "0.1.0",
   "FriendlyName": "WY Vehicle Asset Bridge",
-  "Description": "Editor foundation for vehicle asset exchange between 3ds Max and Unreal Engine.",
+  "Description": "Editor support for exchanging vehicle meshes, skeletons and collision with 3ds Max.",
   "Category": "Editor",
   "CreatedBy": "WY Vehicle Tools",
   "CanContainContent": false,

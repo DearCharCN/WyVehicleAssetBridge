@@ -2,6 +2,7 @@
 #include <max.h>
 #include <gup.h>
 #include <maxversion.h>
+#include "MaxPanel.h"
 
 // The package manifest targets Max 2025; reject another SDK at compile time.
 #if MAX_RELEASE != 27000
@@ -20,12 +21,14 @@ class WyVehicleAssetBridge final : public GUP
 public:
     DWORD Start() override
     {
+        WyVehicleAssetBridgeUI::Initialize(ModuleInstance);
         OutputDebugStringW(L"[WyVehicleAssetBridge] Native 3ds Max vehicle asset bridge 0.1.0 loaded.\n");
         return GUPRESULT_KEEP;
     }
 
     void Stop() override
     {
+        WyVehicleAssetBridgeUI::Shutdown();
         OutputDebugStringW(L"[WyVehicleAssetBridge] Native 3ds Max vehicle asset bridge unloaded.\n");
     }
 
@@ -86,4 +89,17 @@ extern "C" __declspec(dllexport) ULONG CanAutoDefer()
 {
     // GUP initialization belongs to application startup.
     return 0;
+}
+
+extern "C" __declspec(dllexport) int LibInitialize()
+{
+    // Max 2025 builds its menus before GUP::Start; register the notification early.
+    WyVehicleAssetBridgeUI::Initialize(ModuleInstance);
+    return TRUE;
+}
+
+extern "C" __declspec(dllexport) int LibShutdown()
+{
+    WyVehicleAssetBridgeUI::Shutdown();
+    return TRUE;
 }

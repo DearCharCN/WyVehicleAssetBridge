@@ -30,20 +30,29 @@ foreach(sdk_library core maxutil gup)
     endif()
 endforeach()
 
-add_library(WyVehicleAssetBridge SHARED Source/WyVehicleAssetBridge.cpp)
+add_library(WyVehicleAssetBridge SHARED Source/WyVehicleAssetBridge.cpp
+    Source/MaxPanel.cpp Source/MaxTask.cpp Source/MaxScene.cpp Source/MaxSceneExplorer.cpp Source/MaxSceneChanges.cpp
+    Source/MaxColliderPreview.cpp Source/BridgeClient.cpp Source/BridgeCompare.cpp)
 # 3ds Max 2025 uses C++20 (Autodesk CY24 / 2025 VFX platform alignment).
 target_compile_features(WyVehicleAssetBridge PRIVATE cxx_std_20)
-target_compile_definitions(WyVehicleAssetBridge PRIVATE UNICODE _UNICODE _ITERATOR_DEBUG_LEVEL=0)
+target_compile_definitions(WyVehicleAssetBridge PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _ITERATOR_DEBUG_LEVEL=0)
 # A source change must invalidate MSBuild objects even if a file restore preserved its timestamp.
 if(WY_VEHICLE_SOURCE_FINGERPRINT)
     target_compile_definitions(WyVehicleAssetBridge PRIVATE WY_VEHICLE_SOURCE_FINGERPRINT="${WY_VEHICLE_SOURCE_FINGERPRINT}")
 endif()
 target_compile_options(WyVehicleAssetBridge PRIVATE /W4 /permissive- /utf-8)
-target_include_directories(WyVehicleAssetBridge SYSTEM PRIVATE "${MAX_SDK_PATH}/include")
+target_include_directories(WyVehicleAssetBridge SYSTEM PRIVATE "${MAX_SDK_PATH}/include" "${CMAKE_CURRENT_SOURCE_DIR}/ThirdParty")
 target_link_libraries(WyVehicleAssetBridge PRIVATE
     "${MAX_SDK_LIBRARY_DIR}/core.lib"
     "${MAX_SDK_LIBRARY_DIR}/maxutil.lib"
     "${MAX_SDK_LIBRARY_DIR}/gup.lib"
+    "${MAX_SDK_LIBRARY_DIR}/Geom.lib"
+    "${MAX_SDK_LIBRARY_DIR}/gfx.lib"
+    "${MAX_SDK_LIBRARY_DIR}/mesh.lib"
+    "${MAX_SDK_LIBRARY_DIR}/IGame.lib"
+    "${MAX_SDK_LIBRARY_DIR}/Maxscrpt.lib"
+    "${MAX_SDK_LIBRARY_DIR}/MenuMan.lib"
+    ws2_32 bcrypt comctl32 comdlg32 ole32 shell32
 )
 set_target_properties(WyVehicleAssetBridge PROPERTIES
     PREFIX ""

@@ -3,7 +3,7 @@
                     AutodeskProduct="3ds Max"
                     ProductType="Application"
                     Name="WY Vehicle Asset Bridge"
-                    Description="Native 3ds Max foundation for vehicle asset exchange with Unreal Engine."
+                    Description="Vehicle mesh, skeleton and collision synchronization with Unreal Editor."
                     AppVersion="0.1.0"
                     UpgradeCode="{C553E194-75B6-46A1-B101-4FADAE654D85}"
                     ProductCode="{8EE8C717-EE61-43BB-AB4E-9238067D8B7B}">
