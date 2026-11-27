@@ -78,6 +78,37 @@ try {
         Assert-TestTrue (!(Test-Path -LiteralPath $fixture.DeployUE)) '-BuildOnly deployed UE.'
         Assert-TestTrue (!(Test-Path -LiteralPath $fixture.DeployMax)) '-BuildOnly deployed Max.'
     }
+    Test-Case 'UE packaging preserves explicit default enablement and retains UAT metadata' {
+        $enabledFixture = New-TestBridgeFixture $testRoot 'default enablement' $repoRoot $AssemblyPath
+        $sourcePath = Join-Path $enabledFixture.Root 'ue_plugins\WyVehicleAssetBridge\WyVehicleAssetBridge.uplugin'
+        foreach ($mode in @('true','false','absent','absent-uat-true')) {
+            $source = [ordered]@{ FileVersion=3; Version=1; FriendlyName='source descriptor' }
+            if ($mode -eq 'true') { $source.EnabledByDefault = $true }
+            elseif ($mode -eq 'false') { $source.EnabledByDefault = $false }
+            Write-TestFile $sourcePath ($source | ConvertTo-Json)
+            $sourceBytes = [Convert]::ToBase64String([IO.File]::ReadAllBytes($sourcePath))
+            Set-TestRun $enabledFixture @('UE') ('default-' + $mode)
+            if ($mode -eq 'absent-uat-true') {
+                $planPath = Join-Path $enabledFixture.Root 'run.json'
+                $plan = Get-Content -LiteralPath $planPath -Raw | ConvertFrom-Json
+                $plan | Add-Member -NotePropertyName UatEnabledByDefault -NotePropertyValue $true
+                Write-TestFile $planPath ($plan | ConvertTo-Json)
+            }
+            Assert-Code (Invoke-TestBuild $enabledFixture @('-Target','UE','-BuildOnly')) $true
+            $descriptor = Get-Content -LiteralPath (Join-Path $enabledFixture.LatestUE 'WyVehicleAssetBridge.uplugin') -Raw | ConvertFrom-Json
+            if ($mode -eq 'absent') {
+                Assert-TestTrue ($null -eq $descriptor.PSObject.Properties['EnabledByDefault']) 'Source without a default gained an enabled flag.'
+            } else {
+                Assert-TestTrue ($descriptor.EnabledByDefault -is [bool]) 'Packaged default is not a JSON boolean.'
+                Assert-TestTrue ($descriptor.EnabledByDefault -eq ($mode -ne 'false')) 'Explicit source default was lost or an undeclared default was changed.'
+            }
+            Assert-TestTrue ($descriptor.Installed -eq $true -and $descriptor.EngineVersion -eq '5.8.4-qa' -and $descriptor.Version -eq 47) 'UAT packaging metadata was replaced by source metadata.'
+            Assert-TestTrue ($descriptor.Modules[0].LoadingPhase -eq 'PostEngineInit' -and $descriptor.Modules[0].PlatformAllowList[0] -eq 'Win64') 'UAT module metadata was changed.'
+            Assert-TestTrue ($descriptor.UatOnly.Enabled -eq $false -and $descriptor.UatOnly.Tags[1] -eq 'beta' -and $descriptor.UatOnly.Number -eq 123) 'Unknown UAT fields were lost.'
+            Assert-TestTrue ($sourceBytes -eq [Convert]::ToBase64String([IO.File]::ReadAllBytes($sourcePath))) 'Post-processing changed the source descriptor.'
+            Assert-TestTrue (!(Test-Path -LiteralPath $enabledFixture.DeployUE)) 'BuildOnly deployed the test plugin.'
+        }
+    }
     Test-Case 'Either compiler failure and missing artifacts preserve both latest packages' {
         foreach ($target in @('UE','Max')) {
             Set-TestRun $fixture @('UE','Max') 'must-not-replace' $target '' 'both-v1'

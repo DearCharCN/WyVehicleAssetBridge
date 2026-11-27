@@ -21,6 +21,24 @@ namespace WyVehicleAssetBridge.Setup
         internal static string FileName(string root) { return Path.Combine(root, "build_and_deploy.ini"); }
         internal static string IniKey(string key) { return IniKeys[key]; }
 
+        internal static bool ReopenUEAfterPublish(string root)
+        {
+            string value;
+            var settings = ReadSettings(Lines(FileName(root), false));
+            if (!settings.TryGetValue("UE.ReopenAfterPublish", out value)) return false;
+            bool enabled;
+            if (Boolean.TryParse(value, out enabled)) return enabled;
+            if (value == "1" || value == "0") return value == "1";
+            throw new InvalidDataException("UE.ReopenAfterPublish 需要为 true 或 false。");
+        }
+
+        internal static void SaveReopenUEAfterPublish(string root, bool enabled)
+        {
+            var lines = Lines(FileName(root), false);
+            SetValue(lines, "UE.ReopenAfterPublish", enabled ? "true" : "false");
+            WriteLines(FileName(root), lines);
+        }
+
         // Preserve user comments, unknown settings and alternate build configurations on save.
         private static List<string> Lines(string file, bool allowMissing)
         {
@@ -244,7 +262,11 @@ namespace WyVehicleAssetBridge.Setup
             if (!Index(lines).TryGetValue("Build.MaxConfiguration", out configuration) ||
                 !Regex.IsMatch(lines[configuration], @"=\s*""?(Release|RelWithDebInfo)""?\s*$", RegexOptions.IgnoreCase))
                 SetValue(lines, "Build.MaxConfiguration", "Release");
-            string target = FileName(root);
+            WriteLines(FileName(root), lines);
+        }
+
+        private static void WriteLines(string target, List<string> lines)
+        {
             string temp = target + "." + Guid.NewGuid().ToString("N") + ".tmp";
             try
             {

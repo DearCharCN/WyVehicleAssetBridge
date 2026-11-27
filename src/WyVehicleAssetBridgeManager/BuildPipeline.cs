@@ -21,6 +21,12 @@ namespace WyVehicleAssetBridge.Setup
         internal bool Mismatch, Failed;
     }
 
+    internal sealed class PublishRunResult
+    {
+        internal readonly List<string> Published = new List<string>();
+        internal bool Cancelled;
+    }
+
     internal sealed class BuildPipeline
     {
         private readonly string root, configFile, configFolder;
@@ -175,32 +181,7 @@ namespace WyVehicleAssetBridge.Setup
 
         private static void EnsureApplicationsClosed(IEnumerable<BuildTarget> targets)
         {
-            const string query = "SELECT Name,ExecutablePath,CommandLine FROM Win32_Process WHERE Name='UnrealEditor.exe' OR Name='UnrealEditor-Cmd.exe' OR Name='3dsmax.exe' OR Name='3dsmaxbatch.exe'";
-            using (var searcher = new ManagementObjectSearcher(query))
-            using (var processes = searcher.Get())
-            {
-                foreach (ManagementObject process in processes)
-                using (process)
-                {
-                    string name = Convert.ToString(process["Name"]);
-                    foreach (var t in targets)
-                    {
-                        if (t.Name == "Max" && name.StartsWith("3dsmax", StringComparison.OrdinalIgnoreCase))
-                        {
-                            string exe = Convert.ToString(process["ExecutablePath"]);
-                            if (exe.Length == 0 || String.Equals(Path.GetDirectoryName(exe), t.MaxInstall.TrimEnd('\\', '/'), StringComparison.OrdinalIgnoreCase))
-                                throw new InvalidOperationException("请先关闭目标 3ds Max，再发布 Max 插件。仅编译可使用 -BuildOnly。");
-                        }
-                        if (t.Name == "UE" && name.StartsWith("UnrealEditor", StringComparison.OrdinalIgnoreCase))
-                        {
-                            string args = Convert.ToString(process["CommandLine"]).Replace('/', '\\');
-                            if (args.Length == 0 || args.IndexOf(t.ProjectFile, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                                args.IndexOf(Path.GetDirectoryName(t.ProjectFile) + "\\", StringComparison.OrdinalIgnoreCase) >= 0)
-                                throw new InvalidOperationException("请先关闭目标 UE 工程的编辑器，再发布 UE 插件。仅编译可使用 -BuildOnly。");
-                        }
-                    }
-                }
-            }
+            RunningApplications.EnsureClosed(targets);
         }
 
         private void Compile(BuildTarget t)
@@ -242,13 +223,15 @@ namespace WyVehicleAssetBridge.Setup
             return targets;
         }
 
-        internal void Run(string target, bool buildOnly, bool check, bool changedOnly = false)
+        internal PublishRunResult Run(string target, bool buildOnly, bool check, bool changedOnly = false,
+            Action<List<BuildTarget>> prepareApplications = null)
         {
+            var result = new PublishRunResult();
             report("配置文件 " + configFile);
             if (check)
             {
                 if (SelectTargets(target, buildOnly, changedOnly).Count != 0) report("配置检查通过。");
-                return;
+                return result;
             }
             var lockPath = Path.Combine(root, ".build.lock");
             PackageStore.Guard(root, lockPath);
@@ -258,8 +241,14 @@ namespace WyVehicleAssetBridge.Setup
             using (handle)
             {
                 var targets = SelectTargets(target, buildOnly, changedOnly);
-                if (targets.Count == 0) return;
-                if (!buildOnly) EnsureApplicationsClosed(targets);
+                if (targets.Count == 0) return result;
+                if (!buildOnly)
+                {
+                    if (prepareApplications != null) prepareApplications(targets);
+                    if (targets.Count == 0) { result.Cancelled = true; return result; }
+                    EnsureApplicationsClosed(targets);
+                }
+                var builtTargets = targets.ToArray();
                 var tasks = targets.Select(t => Task.Run(() => Compile(t))).ToArray();
                 try { Task.WaitAll(tasks); }
                 catch (AggregateException ex) {
@@ -271,18 +260,27 @@ namespace WyVehicleAssetBridge.Setup
                 report("已更新本地 build/latest。");
                 if (!buildOnly)
                 {
+                    // Recheck after a long build. The GUI may ask again if the user
+                    // restarted an application while compilation was in progress.
+                    if (prepareApplications != null) prepareApplications(targets);
                     EnsureApplicationsClosed(targets);
                     var installs = targets.Select(t => new PackageItem { Name=t.Name, Root=t.DeployRoot,
                         Source=Path.Combine(t.BuildRoot, "latest", "WyVehicleAssetBridge"), Destination=t.Destination });
-                    PackageStore.Install(installs, report);
-                    report("发布完成，下次启动目标应用时加载新插件。");
+                    if (targets.Count > 0)
+                    {
+                        PackageStore.Install(installs, report);
+                        result.Published.AddRange(targets.Select(t => t.Name));
+                        report("发布完成，下次启动目标应用时加载新插件。");
+                    }
+                    else result.Cancelled = true;
                 }
-                foreach (var t in targets)
+                foreach (var t in builtTargets)
                 {
                     try { PackageStore.Remove(t.BuildRoot, Path.GetDirectoryName(t.Stage)); }
                     catch (IOException ex) { report("无法清理临时产物：" + ex.Message); }
                 }
             }
+            return result;
         }
     }
 }

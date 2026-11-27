@@ -5,6 +5,7 @@ using System.Globalization;
 using System.IO;
 using System.Security.Cryptography;
 using System.Text;
+using System.Web.Script.Serialization;
 
 namespace WyVehicleAssetBridge.Setup
 {
@@ -35,6 +36,7 @@ namespace WyVehicleAssetBridge.Setup
                         };
                         CheckUnrealBatchCompatibility(t.ToolPath, arguments);
                         Run(t.ToolPath, arguments, t.Source, null, log);
+                        RestoreUnrealDefaultEnablement(t, log);
                     }
                     else BuildMax(t, sourceFingerprint, log);
                     log.EnsureHealthy();
@@ -47,6 +49,25 @@ namespace WyVehicleAssetBridge.Setup
                     throw;
                 }
             }
+        }
+
+        private static void RestoreUnrealDefaultEnablement(BuildTarget target, BuildLog log)
+        {
+            // BuildPlugin may remove EnabledByDefault while setting Installed and
+            // target-platform metadata. Restore only an explicit source preference.
+            const string descriptorName = "WyVehicleAssetBridge.uplugin";
+            var source = LocalConfig.Json(Path.Combine(target.Source, descriptorName));
+            object enabled;
+            if (!source.TryGetValue("EnabledByDefault", out enabled)) return;
+            if (!(enabled is bool))
+                throw new InvalidDataException("源插件的 EnabledByDefault 必须为 JSON 布尔值。");
+
+            string descriptor = Path.Combine(target.Stage, descriptorName);
+            PackageStore.Guard(target.Stage, descriptor);
+            var packaged = LocalConfig.Json(descriptor);
+            packaged["EnabledByDefault"] = enabled;
+            File.WriteAllText(descriptor, new JavaScriptSerializer().Serialize(packaged), new UTF8Encoding(false));
+            log.Write("已保留源插件 EnabledByDefault=" + ((bool)enabled ? "true" : "false") + "。");
         }
 
         private static void BuildMax(BuildTarget t, string sourceFingerprint, BuildLog log)

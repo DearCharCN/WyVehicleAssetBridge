@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -415,6 +416,67 @@ namespace WyVehicleAssetBridge.Setup
             publishLog.ScrollToCaret();
         }
 
+        private void PreparePublishApplications(List<BuildTarget> targets,
+            Dictionary<string, EditorRestart> restarts, Action<string> report)
+        {
+            // Ask about Max first, so declining its publication need not close UE.
+            foreach (var target in targets.OrderBy(t => t.Name == "Max" ? 0 : 1).ToArray())
+            {
+                if (RunningApplications.Find(target).Count == 0) continue;
+                Func<bool> stillRunning = () => RunningApplications.Find(target).Count != 0;
+                if (target.Name == "Max")
+                {
+                    if (!PublishCloseDialog.ConfirmMax(this, stillRunning))
+                    {
+                        targets.Remove(target);
+                        report("已取消本次 Max 插件发布。");
+                    }
+                    continue;
+                }
+                while (true)
+                {
+                    bool reopen;
+                    var choice = PublishCloseDialog.ConfirmUE(this, LocalConfig.ReopenUEAfterPublish(root),
+                        value => LocalConfig.SaveReopenUEAfterPublish(root, value), stillRunning, out reopen);
+                    if (choice == PublishCloseChoice.Cancel)
+                    {
+                        targets.Remove(target);
+                        restarts.Remove(target.ProjectFile);
+                        report("已取消本次 UE 插件发布。");
+                        break;
+                    }
+                    if (choice == PublishCloseChoice.Manual)
+                    {
+                        // This is a per-publication override, never an INI change.
+                        restarts.Remove(target.ProjectFile);
+                        report("已确认 UE 手动关闭；本次发布后不会自动重新打开 UE。");
+                        break;
+                    }
+                    var running = RunningApplications.Find(target);
+                    if (running.Count == 0)
+                    {
+                        restarts.Remove(target.ProjectFile);
+                        report("UE 已在自动保存前关闭；本次发布后不会自动重新打开 UE。");
+                        break;
+                    }
+                    if (running.Count != 1 || !running[0].IdentityKnown || running[0].Headless)
+                    {
+                        string message = running.Count != 1
+                            ? "检测到多个可能属于目标工程的 UE 进程。请分别保存并关闭，再点击“我已手动关闭”。"
+                            : "无法安全自动操作该 UE 进程。请手动保存并关闭，再点击“我已手动关闭”。\r\n" + running[0].IdentityIssue;
+                        MessageBox.Show(this, message, "无法自动关闭 UE", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        continue;
+                    }
+                    var closed = EditorShutdown.Execute(this, running[0], report);
+                    if (closed == EditorShutdownResult.Cancelled) continue;
+                    if (closed == EditorShutdownResult.Closed && reopen)
+                        restarts[target.ProjectFile] = new EditorRestart { Executable = running[0].Executable, ProjectFile = target.ProjectFile };
+                    else restarts.Remove(target.ProjectFile);
+                    break;
+                }
+            }
+        }
+
         private async Task PublishAsync(string target)
         {
             if (busy) return;
@@ -426,16 +488,37 @@ namespace WyVehicleAssetBridge.Setup
             string selection = target == "Both" ? "全部插件" : target == "Changed" ? "有版本差异的插件" : target + " 插件";
             publishStatus.Text = "正在编译并发布" + selection + "…";
             var lines = new ConcurrentQueue<string>();
+            var restarts = new Dictionary<string, EditorRestart>(StringComparer.OrdinalIgnoreCase);
             using (var timer = new Timer { Interval = 120 })
             {
                 timer.Tick += delegate { AppendLog(lines); };
                 timer.Start();
                 try
                 {
-                    await Task.Run(() => new BuildPipeline(root, null, lines.Enqueue)
-                        .Run(target == "Changed" ? "Both" : target, false, false, target == "Changed"));
+                    var result = await Task.Run(() => new BuildPipeline(root, null, lines.Enqueue)
+                        .Run(target == "Changed" ? "Both" : target, false, false, target == "Changed", targets =>
+                            Invoke(new Action(() => PreparePublishApplications(targets, restarts, lines.Enqueue)))));
                     publishStatus.ForeColor = Good;
-                    publishStatus.Text = target == "Changed" ? "增量发布完成。" : selection + "发布成功。";
+                    publishStatus.Text = result.Cancelled ? "已取消本次发布。" : result.Published.Count == 0
+                        ? "没有需要增量发布的插件。" : String.Join("、", result.Published) + " 插件发布成功。";
+                    if (result.Published.Contains("UE"))
+                    {
+                        foreach (var restart in restarts.Values)
+                        {
+                            try
+                            {
+                                lines.Enqueue("正在重新打开 UE 工程并恢复上次地图和资产窗口…");
+                                await Task.Run(() => restart.Start());
+                                lines.Enqueue("已启动 UE，正在加载工程。");
+                            }
+                            catch (Exception error)
+                            {
+                                lines.Enqueue("插件已发布，但 UE 重新打开失败：" + error.Message);
+                                publishStatus.ForeColor = Attention;
+                                publishStatus.Text = "插件发布成功，但 UE 重新打开失败，请查看日志。";
+                            }
+                        }
+                    }
                 }
                 catch (Exception ex)
                 {

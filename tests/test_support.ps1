@@ -267,7 +267,18 @@ try {
         }
         foreach ($file in $files + @('version.txt')) {
             if ($plan.Missing -eq $role -and ($file.EndsWith('.dll') -or $file.EndsWith('.gup'))) { continue }
-            Put (Join-Path $package $file) $plan.Version
+            if ($role -eq 'UE' -and $file.EndsWith('.uplugin')) {
+                # Model UAT's rewritten descriptor: it drops EnabledByDefault but
+                # adds packaging metadata that the manager must not overwrite.
+                $descriptor = [ordered]@{
+                    FileVersion=3; Version=47; VersionName=$plan.Version
+                    EngineVersion='5.8.4-qa'; Installed=$true
+                    Modules=@(@{ Name='WyVehicleAssetBridge'; Type='Editor'; LoadingPhase='PostEngineInit'; PlatformAllowList=@('Win64') })
+                    UatOnly=@{ Enabled=$false; Tags=@('packaged','beta'); Number=123 }
+                }
+                if ($plan.PSObject.Properties['UatEnabledByDefault']) { $descriptor.EnabledByDefault = $plan.UatEnabledByDefault }
+                Put (Join-Path $package $file) ($descriptor | ConvertTo-Json -Depth 8)
+            } else { Put (Join-Path $package $file) $plan.Version }
         }
         Write-Output "fake $role package complete"
     }
