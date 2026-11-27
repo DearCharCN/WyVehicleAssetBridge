@@ -25,12 +25,15 @@
 #include "ScopedTransaction.h"
 #include "Misc/PackageName.h"
 #include "Misc/Change.h"
+#include "Misc/ScopedSlowTask.h"
 #include "Editor/TransBuffer.h"
 #include "UObject/Package.h"
 #include "UObject/SoftObjectPath.h"
 #include "Serialization/JsonSerializer.h"
 #include "CompGeom/ConvexHull3.h"
 #include "Chaos/Convex.h"
+
+#define LOCTEXT_NAMESPACE "WyVehicleBridgeAssets"
 
 namespace WyAssets
 {
@@ -39,6 +42,14 @@ using JObject = TSharedPtr<FJsonObject>;
 static const FName OwnerAttribute(TEXT("WyVehiclePartOwner"));
 static const FName PartNameAttribute(TEXT("WyVehiclePartName"));
 static const FName UVCountAttribute(TEXT("WyVehicleOriginalUVCount"));
+
+// Advance once per batch so a single dense mesh can repaint the progress window.
+void EnterGeometryBatch(FScopedSlowTask &Progress, int32 Index, int32 Count)
+{
+    constexpr int32 BatchSize = 4096;
+    if (Index % BatchSize == 0)
+        Progress.EnterProgressFrame(FMath::Min(BatchSize, Count - Index));
+}
 
 JObject Error(const FString &Message)
 {
@@ -629,8 +640,11 @@ JObject ReadMesh(const FMeshDescription &M, const TSet<FVertexID> *Selected, con
             }
         }
     JArray MaterialIds;
-    for (auto T : M.Triangles().GetElementIDs())
+    int32 TriangleIndex = 0;
+    for (FScopedSlowTask Faces(M.Triangles().Num(), LOCTEXT("ReadFaces", "读取三角形与顶点属性"));
+         auto T : M.Triangles().GetElementIDs())
     {
+        EnterGeometryBatch(Faces, TriangleIndex++, M.Triangles().Num());
         auto V = M.GetTriangleVertices(T);
         if (!Index.Contains(V[0]) || !Index.Contains(V[1]) || !Index.Contains(V[2]))
             continue;
@@ -776,8 +790,10 @@ bool ReplaceMesh(FMeshDescription &M, const FMeshInput &Input, const FString &Pa
     TMap<FName, FPolygonGroupID> GroupsBySlot;
     for (auto G : M.PolygonGroups().GetElementIDs())
         GroupsBySlot.Add(A.GetPolygonGroupMaterialSlotNames()[G], G);
+    FScopedSlowTask Faces(Input.Triangles.Num(), LOCTEXT("WriteFaces", "写入三角形与顶点属性"));
     for (int32 I = 0; I < Input.Triangles.Num(); ++I)
     {
+        EnterGeometryBatch(Faces, I, Input.Triangles.Num());
         TArray<FVertexInstanceID> Corners;
         for (int32 C = 0; C < 3; ++C)
         {
@@ -1162,6 +1178,9 @@ FString StaticMeshConflict(const FString &Part)
 }
 JObject Read(const FVehicle &V)
 {
+    FScopedSlowTask Progress(5.f, LOCTEXT("ReadAssets", "读取车辆资源"));
+    Progress.Visibility = ESlowTaskVisibility::ForceVisible;
+    Progress.EnterProgressFrame(1.f, LOCTEXT("ReadSkeleton", "读取骨骼"));
     JArray Items;
     if (auto *Skeleton = Cast<USkeleton>(FindAsset(V.SkeletonPath)))
     {
@@ -1169,13 +1188,16 @@ JObject Read(const FVehicle &V)
         Root->SetStringField(TEXT("asset"), Skeleton->GetOutermost()->GetName());
         Items.Add(JV(Root));
     }
+    Progress.EnterProgressFrame(2.f, LOCTEXT("ReadSkinned", "读取骨骼网格体"));
     if (auto *Mesh = Cast<USkeletalMesh>(FindAsset(V.Skeletal())))
     {
         TArray<USkinnedAsset *> Wait = {Mesh};
         FSkinnedAssetCompilingManager::Get().FinishCompilation(Wait);
         const auto Scopes = WyLoadSlotScopes(Mesh);
+        FScopedSlowTask Lods(Mesh->GetNumSourceModels());
         for (int32 L = 0; L < Mesh->GetNumSourceModels(); ++L)
         {
+            Lods.EnterProgressFrame(1.f, FText::Format(LOCTEXT("ReadSkeletalLOD", "读取车身 LOD{0}"), L));
             auto *M = Mesh->GetMeshDescription(L);
             FString Why;
             TMap<FVertexID, int32> Owners;
@@ -1187,9 +1209,11 @@ JObject Read(const FVehicle &V)
                 continue;
             }
             const auto Materials = WyMeshSlotView(Mesh, L, *M);
+            FScopedSlowTask Parts(Names.Num());
             for (int32 P = 0; P < Names.Num(); ++P)
             {
                 FString Name = Names[P];
+                Parts.EnterProgressFrame(1.f, FText::FromString(Name));
                 const FString Prefix = FString::Printf(TEXT("LOD%d_"), L);
                 if (!Name.StartsWith(Prefix))
                 {
@@ -1219,6 +1243,7 @@ JObject Read(const FVehicle &V)
             }
         }
     }
+    Progress.EnterProgressFrame(1.f, LOCTEXT("ReadStatic", "读取静态网格体"));
     TArray<FAssetData> Assets;
     FAssetRegistryModule::GetRegistry().GetAssetsByPath(FName(*(V.Base / TEXT("StaticMesh"))), Assets, false);
     TSet<FString> KnownParts;
@@ -1230,8 +1255,9 @@ JObject Read(const FVehicle &V)
     }
     TArray<FString> Parts = KnownParts.Array();
     Parts.Sort();
-    for (const FString &Part : Parts)
+    for (FScopedSlowTask StaticMeshes(Parts.Num()); const FString &Part : Parts)
     {
+        StaticMeshes.EnterProgressFrame(1.f, FText::FromString(Part));
         const FStaticMeshMatch Match = MatchStaticMesh(V, Part);
         if (Match.ConflictLods)
         {
@@ -1250,9 +1276,11 @@ JObject Read(const FVehicle &V)
         TArray<UStaticMesh *> Wait = {Mesh};
         FStaticMeshCompilingManager::Get().FinishCompilation(Wait);
         const auto Scopes = WyLoadSlotScopes(Mesh);
+        FScopedSlowTask Lods(Mesh->GetNumSourceModels());
         for (int32 L = 0; L < Mesh->GetNumSourceModels(); ++L)
         {
             const FString Name = FString::Printf(TEXT("LOD%d_%s"), L, *Part);
+            Lods.EnterProgressFrame(1.f, FText::FromString(Name));
             const auto *M = Mesh->GetMeshDescription(L);
             auto Out = M ? Item(TEXT("staticMesh"), Name, L, ReadMesh(*M, nullptr, nullptr, WyMeshSlotView(Mesh, L, *M), Scopes.Find(Name), V))
                          : Unmatched(TEXT("staticMesh"), Name, L, TEXT("LOD has no source MeshDescription"));
@@ -1260,6 +1288,7 @@ JObject Read(const FVehicle &V)
             Items.Add(JV(Out));
         }
     }
+    Progress.EnterProgressFrame(1.f, LOCTEXT("ReadCollision", "读取车身碰撞"));
     if (auto *Physics = Cast<UPhysicsAsset>(FindAsset(V.Physics())))
     {
         auto Out = ReadPhysics(Physics, V);
@@ -1274,6 +1303,7 @@ JObject Read(const FVehicle &V)
     for (bool Animation : {false, true})
         BlueprintPaths.Add(MakeShared<FJsonValueString>(TEXT("Content") + V.Blueprint(Animation).RightChop(5) + TEXT(".uasset")));
     Result->SetArrayField(TEXT("blueprintPaths"), BlueprintPaths);
+    Progress.EnterProgressFrame(0.f);
     return Result;
 }
 
@@ -1494,6 +1524,8 @@ void ApplyPhysics(UPhysicsAsset *Asset, const FKAggregateGeom &Shapes, bool Exis
         {
             Body = NewObject<USkeletalBodySetup>(Asset, NAME_None, RF_Transactional);
             Body->BoneName = TEXT("Body");
+            Body->PhysicsType = PhysType_Simulated;
+            Body->CollisionTraceFlag = CTF_UseSimpleAsComplex;
             Asset->SkeletalBodySetups.Add(Body);
         }
         Body->AggGeom = Shapes;
@@ -1501,6 +1533,7 @@ void ApplyPhysics(UPhysicsAsset *Asset, const FKAggregateGeom &Shapes, bool Exis
         Body->CreatePhysicsMeshes();
     }
     Asset->UpdateBodySetupIndexMap();
+    Asset->UpdateBoundsBodiesArray();
     Asset->PostEditChange();
     Asset->GetOutermost()->SetDirtyFlag(Dirty);
 }
@@ -1880,6 +1913,9 @@ JObject Write(const JObject &R, const FVehicle &V)
     const JArray *Items = nullptr;
     if (!R->TryGetArrayField(TEXT("items"), Items) || Items->IsEmpty() || Items->Num() > 4096)
         return Error(TEXT("write requires nonempty items"));
+    FScopedSlowTask Progress(CreateBlueprints ? 14.f : 12.f, LOCTEXT("WriteAssets", "写入车辆资源"));
+    Progress.Visibility = ESlowTaskVisibility::ForceVisible;
+    Progress.EnterProgressFrame(1.f, LOCTEXT("CheckSkeleton", "检查载具骨骼与输入列表"));
     FString Why;
     FReferenceSkeleton Ref;
     bool WriteSkeleton = false, HaveRef = false, NeedsRef = false;
@@ -1954,12 +1990,14 @@ JObject Write(const JObject &R, const FVehicle &V)
             B->TryGetNumberField(TEXT("lod"), R);
             return L < R;
         });
+    const float WorkPerItem = 4.f / Input.Num();
     for (const auto &O : Input)
     {
         FString Kind, Name, Id;
         O->TryGetStringField(TEXT("kind"), Kind);
         O->TryGetStringField(TEXT("name"), Name);
         O->TryGetStringField(TEXT("id"), Id);
+        Progress.EnterProgressFrame(WorkPerItem, FText::Format(LOCTEXT("PreparePart", "校验并准备 {0}"), FText::FromString(Id)));
         const JObject *Data = nullptr;
         if (!O->TryGetObjectField(TEXT("data"), Data))
             return Error(TEXT("Item data missing"));
@@ -2091,6 +2129,7 @@ JObject Write(const JObject &R, const FVehicle &V)
         if (!Skel && Mesh.HasNamedSlots)
             SetStaticSectionMaterials(P.Mesh, Lod, Slots);
     }
+    Progress.EnterProgressFrame(1.f, LOCTEXT("CheckDependencies", "检查目标资源和依赖"));
     if (WriteSkeleton)
     {
         if (UObject *Occupant = FindAsset(V.SkeletonPath))
@@ -2144,6 +2183,7 @@ JObject Write(const JObject &R, const FVehicle &V)
     // Their initialization must not also serialize their original outer/name in
     // this transaction, or the engine can move them back after creation undo.
     TArray<UObject *> Created;
+    Progress.EnterProgressFrame(1.f, LOCTEXT("ApplyMaterials", "准备车辆材质实例"));
     WyCreatePlannedVehicleMaterials(MaterialPlan, Created);
     TOptional<FScopedTransaction> Transaction;
     if (!CreateBlueprints)
@@ -2155,8 +2195,10 @@ JObject Write(const JObject &R, const FVehicle &V)
                                   RF_Public | RF_Standalone | RF_Transactional);
     };
     USkeleton *Skeleton = ExistingSkeleton ? ExistingSkeleton : (ExistingMesh ? ExistingMesh->GetSkeleton() : nullptr);
+    const float WorkPerAsset = 4.f / (Plans.Num() + (WriteSkeleton ? 1 : 0));
     if (WriteSkeleton)
     {
+        Progress.EnterProgressFrame(WorkPerAsset, LOCTEXT("WriteSkeleton", "写入车辆骨骼"));
         Skeleton = ExistingSkeleton;
         if (!Skeleton)
         {
@@ -2171,6 +2213,8 @@ JObject Write(const JObject &R, const FVehicle &V)
     }
     for (auto &P : Plans)
     {
+        Progress.EnterProgressFrame(WorkPerAsset, FText::Format(LOCTEXT("BuildAsset", "构建 {0}"),
+            FText::FromString(FPackageName::GetLongPackageAssetName(P.Path))));
         if (!P.Object)
         {
             UClass *Class =
@@ -2212,6 +2256,7 @@ JObject Write(const JObject &R, const FVehicle &V)
         }
         P.Object->MarkPackageDirty();
     }
+    Progress.EnterProgressFrame(0.5f, LOCTEXT("LinkPhysics", "关联骨骼网格体与物理资产"));
     if (BodyMesh || BodyPhysics)
     {
         auto *Mesh = BodyMesh ? CastChecked<USkeletalMesh>(BodyMesh->Object) : ExistingMesh;
@@ -2226,11 +2271,16 @@ JObject Write(const JObject &R, const FVehicle &V)
         auto *Mesh = CastChecked<USkeletalMesh>(BodyMesh->Object);
         // Factories perform an initial compile internally without a SkipSave option.
         TGuardValue<TEnumAsByte<ESaveOnCompile>> NoAutoSave(GetMutableDefault<UBlueprintEditorSettings>()->SaveOnCompile, SoC_Never);
-        const bool Ok = WyCreateAnimBlueprint(CreatePackage(*AnimPath), FName(*FPackageName::GetLongPackageAssetName(AnimPath)),
-                                              Skeleton, Mesh, Animation, Why) &&
-                        WyCreateVehicleBlueprint(CreatePackage(*ActorPath), FName(*FPackageName::GetLongPackageAssetName(ActorPath)),
-                            VehicleParent, Mesh, Animation, CastChecked<UStaticMesh>(Hub->Object), CastChecked<UStaticMesh>(Tire->Object),
-                            CastChecked<UStaticMesh>(FrontBrake->Object), CastChecked<UStaticMesh>(RearBrake->Object), Actor, Why);
+        Progress.EnterProgressFrame(1.f, LOCTEXT("CreateAnimBlueprint", "创建并编译动画蓝图"));
+        bool Ok = WyCreateAnimBlueprint(CreatePackage(*AnimPath), FName(*FPackageName::GetLongPackageAssetName(AnimPath)),
+                                        Skeleton, Mesh, Animation, Why);
+        if (Ok)
+        {
+            Progress.EnterProgressFrame(1.f, LOCTEXT("CreateVehicleBlueprint", "创建并编译车辆蓝图"));
+            Ok = WyCreateVehicleBlueprint(CreatePackage(*ActorPath), FName(*FPackageName::GetLongPackageAssetName(ActorPath)),
+                VehicleParent, Mesh, Animation, CastChecked<UStaticMesh>(Hub->Object), CastChecked<UStaticMesh>(Tire->Object),
+                CastChecked<UStaticMesh>(FrontBrake->Object), CastChecked<UStaticMesh>(RearBrake->Object), Actor, Why);
+        }
         if (Animation) Created.Add(Animation);
         if (Actor) Created.Add(Actor);
         if (!Ok)
@@ -2249,6 +2299,7 @@ JObject Write(const JObject &R, const FVehicle &V)
         }
         Transaction.Emplace(NSLOCTEXT("WyVehicleAssetBridge", "CreateVehicle", "Create vehicle assets and blueprints"));
     }
+    Progress.EnterProgressFrame(0.5f, LOCTEXT("RegisterAssets", "登记资源与撤销记录"));
     for (auto *O : Created)
     {
         O->MarkPackageDirty();
@@ -2258,6 +2309,7 @@ JObject Write(const JObject &R, const FVehicle &V)
     }
     auto Result = MakeShared<FJsonObject>();
     Result->SetBoolField(TEXT("ok"), true);
+    Progress.EnterProgressFrame(0.f);
     return Result;
 }
 } // namespace WyAssets
@@ -2281,3 +2333,5 @@ TSharedPtr<FJsonObject> WyHandleAssets(const TSharedPtr<FJsonObject> &Request)
         return WyAssets::Write(Request, Vehicle);
     return WyAssets::Error(TEXT("Unknown asset operation"));
 }
+
+#undef LOCTEXT_NAMESPACE

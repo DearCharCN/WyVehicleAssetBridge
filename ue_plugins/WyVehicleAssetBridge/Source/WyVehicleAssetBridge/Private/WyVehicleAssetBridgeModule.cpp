@@ -7,6 +7,7 @@
 #include "Misc/App.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
+#include "Misc/ScopedSlowTask.h"
 #include "Misc/SecureHash.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -94,6 +95,8 @@ FObject Hello()
 
 FObject Read(const FObject& Request, const FString& Path)
 {
+    FScopedSlowTask Progress(4.f, NSLOCTEXT("WyVehicleAssetBridge", "ReadSnapshot", "正在读取 UE 资源快照"));
+    Progress.EnterProgressFrame(3.f);
     FObject Query = MakeShared<FJsonObject>();
     Query->SetStringField(TEXT("op"), TEXT("read"));
     Query->SetObjectField(TEXT("vehicle"), Request->GetObjectField(TEXT("vehicle")));
@@ -101,8 +104,11 @@ FObject Read(const FObject& Request, const FString& Path)
     const TArray<TSharedPtr<FJsonValue>>* Items;
     if (!Result.IsValid() || !Result->TryGetArrayField(TEXT("items"), Items))
         return Result;
+    Progress.EnterProgressFrame(1.f, NSLOCTEXT("WyVehicleAssetBridge", "CompareSnapshot", "正在计算 UE 资源指纹"));
+    FScopedSlowTask Revisions(Items->Num() + 1.f);
     for (const auto& Value : *Items)
     {
+        Revisions.EnterProgressFrame(1.f);
         FObject Item = Value->AsObject();
         if (!Item.IsValid())
             return Reply(TEXT("无效的 UE 资源快照"));
@@ -112,6 +118,7 @@ FObject Read(const FObject& Request, const FString& Path)
         const FTCHARToUTF8 Bytes(*Snapshot);
         Item->SetStringField(TEXT("revision"), FMD5::HashBytes(reinterpret_cast<const uint8*>(Bytes.Get()), Bytes.Length()));
     }
+    Revisions.EnterProgressFrame(1.f);
     bool CanCreate = Items->IsEmpty();
     if (CanCreate)
     {
@@ -137,11 +144,25 @@ FObject Read(const FObject& Request, const FString& Path)
     return Result;
 }
 
-FObject Dispatch(const FObject& Request)
+FText RequestProgressTitle(const FObject& Request, const FString& Op)
 {
-    FString Op, Path;
-    if (!Request->TryGetStringField(TEXT("op"), Op))
-        return Reply(TEXT("缺少操作名称"));
+    if (Op == TEXT("read"))
+        return NSLOCTEXT("WyVehicleAssetBridge", "ReadForMax", "正在读取 UE 载具资源并返回 Max");
+    if (Op == TEXT("write"))
+    {
+        bool bFirstCreate = false;
+        Request->TryGetBoolField(TEXT("createVehicleBlueprints"), bFirstCreate);
+        return bFirstCreate ? NSLOCTEXT("WyVehicleAssetBridge", "FirstCreate", "正在首次创建载具资源")
+                            : NSLOCTEXT("WyVehicleAssetBridge", "WriteFromMax", "正在将 Max 载具资源同步到 UE");
+    }
+    if (Op == TEXT("hulls"))
+        return NSLOCTEXT("WyVehicleAssetBridge", "BuildBodyHulls", "正在构建车身凸包");
+    return FText::GetEmpty();
+}
+
+FObject Dispatch(const FObject& Request, const FString& Op)
+{
+    FString Path;
     if (Op == TEXT("hello"))
         return Hello();
     if (Op == TEXT("hulls"))
@@ -160,6 +181,8 @@ FObject Dispatch(const FObject& Request)
     if (!Request->TryGetObjectField(TEXT("expected"), Expected) || !Request->TryGetArrayField(TEXT("items"), Changes) ||
         Changes->IsEmpty())
         return Reply(TEXT("写入前必须提供所选资源的比对版本"));
+    FScopedSlowTask Sync(5.f);
+    Sync.EnterProgressFrame(1.f, NSLOCTEXT("WyVehicleAssetBridge", "CheckTarget", "正在核对目标资源版本"));
     FObject Current = Read(Request, Path);
     const TArray<TSharedPtr<FJsonValue>>* Items;
     if (!Current.IsValid() || !Current->TryGetArrayField(TEXT("items"), Items))
@@ -187,6 +210,7 @@ FObject Dispatch(const FObject& Request)
             return Reply(TEXT("UE 数据在比对后已改变，请重新比对"));
         Unique.Add(Id);
     }
+    Sync.EnterProgressFrame(4.f);
     return WyHandleAssets(Request);
 }
 
@@ -200,12 +224,39 @@ struct FPeer
     void Respond()
     {
         FObject Request, Result;
+        // A large mesh payload can spend noticeable time in JSON decoding before its op is known.
+        // Keep one dialog for the request, including the optimistic read and response encoding.
+        TOptional<FScopedSlowTask> Progress;
+        if (FrameBytes >= TickBudget)
+        {
+            Progress.Emplace(10.f, NSLOCTEXT("WyVehicleAssetBridge", "DecodeRequest", "正在解析 Max 发来的数据"));
+            Progress->MakeDialog(false, true);
+            Progress->EnterProgressFrame(1.f);
+        }
         FUTF8ToTCHAR Text(reinterpret_cast<const ANSICHAR*>(Input.GetData() + 4), FrameBytes);
         auto Reader = TJsonReaderFactory<>::Create(FString(Text.Length(), Text.Get()));
         if (FJsonSerializer::Deserialize(Reader, Request) && Request.IsValid())
-            Result = Dispatch(Request);
+        {
+            FString Op;
+            if (Request->TryGetStringField(TEXT("op"), Op))
+            {
+                const FText Title = RequestProgressTitle(Request, Op);
+                if (!Title.IsEmpty() && !Progress.IsSet())
+                {
+                    Progress.Emplace(9.f, Title);
+                    Progress->MakeDialog(false, true);
+                }
+                if (Progress.IsSet())
+                    Progress->EnterProgressFrame(8.f, Title);
+                Result = Dispatch(Request, Op);
+            }
+            else
+                Result = Reply(TEXT("缺少操作名称"));
+        }
         if (!Result.IsValid())
             Result = Reply(TEXT("无效的桥接请求或响应"));
+        if (Progress.IsSet())
+            Progress->EnterProgressFrame(1.f, NSLOCTEXT("WyVehicleAssetBridge", "PrepareMaxReply", "正在打包返回 Max 的数据"));
         FString Json = Encode(Result);
         if (FTCHARToUTF8(*Json).Length() > MaxFrame)
             Json = Encode(Reply(TEXT("资源快照超过单次传输上限")));
@@ -220,6 +271,8 @@ struct FPeer
         Sent = 0;
         LastIO = FPlatformTime::Seconds();
         HasRequest = true;
+        if (Progress.IsSet())
+            Progress->EnterProgressFrame(0.f, NSLOCTEXT("WyVehicleAssetBridge", "MaxReplyReady", "已准备好返回 Max 的数据"));
     }
     bool Pump(ISocketSubsystem& Subsystem)
     {

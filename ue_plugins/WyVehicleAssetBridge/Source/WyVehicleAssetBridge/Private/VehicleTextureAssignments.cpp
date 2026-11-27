@@ -7,6 +7,7 @@
 #include "MaterialEditingLibrary.h"
 #include "Materials/MaterialInstanceConstant.h"
 #include "Misc/PackageName.h"
+#include "Misc/ScopedSlowTask.h"
 #include "ScopedTransaction.h"
 
 namespace
@@ -68,6 +69,8 @@ void WyVehicleTextures::Scan(const FString& VehicleRoot, TArray<TSharedPtr<FWyVe
     if (VehicleRoot.IsEmpty() || VehicleRootForFolder(VehicleRoot) != VehicleRoot)
         return;
 
+    FScopedSlowTask Progress(2.f, NSLOCTEXT("WyVehicleTextures", "Scan", "匹配材质贴图"));
+    Progress.EnterProgressFrame(1.f, NSLOCTEXT("WyVehicleTextures", "FindMaterials", "查找车辆材质实例"));
     auto& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
     const FString Folder = VehicleRoot / TEXT("MaterialInstance");
     if (Registry.IsLoadingAssets())
@@ -84,6 +87,8 @@ void WyVehicleTextures::Scan(const FString& VehicleRoot, TArray<TSharedPtr<FWyVe
     });
     for (const FAssetData& Material : Materials)
     {
+        Progress.EnterProgressFrame(1.f / Materials.Num(), FText::Format(
+            NSLOCTEXT("WyVehicleTextures", "CheckMaterial", "检查 {0} 的贴图"), FText::FromName(Material.AssetName)));
         UMaterialInstanceConstant* Instance = nullptr;
         TArray<WyVehiclePbr::FTextureBinding> Bindings;
         if (!MaterialBindings(VehicleRoot, Material, Instance, Bindings))
@@ -110,11 +115,16 @@ FText WyVehicleTextures::Apply(const FString& VehicleRoot, const TArray<TSharedP
     const FString Folder = VehicleRoot / TEXT("MaterialInstance");
     TSet<UMaterialInstanceConstant*> Changed;
     int32 Stale = 0;
+    FScopedSlowTask Progress(2.f, NSLOCTEXT("WyVehicleTextures", "AssignProgress", "为载具材质赋值贴图"), Rows.Num() > 1);
+    Progress.MakeDialogDelayed(0.35f);
     TOptional<FScopedTransaction> Transaction;
     for (const auto& Row : Rows)
     {
         if (!Row || Row->bApplied)
             continue;
+        Progress.EnterProgressFrame(1.f / Rows.Num(), FText::Format(
+            NSLOCTEXT("WyVehicleTextures", "AssignField", "设置 {0} 的 {1}"), FText::FromName(Row->Material.AssetName),
+            FText::FromName(Row->Parameter)));
         const FString MaterialFolder = Row->Material.PackagePath.ToString();
         UMaterialInstanceConstant* Instance = nullptr;
         TArray<WyVehiclePbr::FTextureBinding> Bindings;
@@ -148,7 +158,11 @@ FText WyVehicleTextures::Apply(const FString& VehicleRoot, const TArray<TSharedP
         Row->bApplied = true;
     }
     for (auto* Instance : Changed)
+    {
+        Progress.EnterProgressFrame(1.f / Changed.Num(), FText::Format(
+            NSLOCTEXT("WyVehicleTextures", "UpdateMaterial", "更新材质 {0}"), FText::FromName(Instance->GetFName())));
         UMaterialEditingLibrary::UpdateMaterialInstance(Instance);
+    }
     if (Stale > 0)
         return FText::Format(NSLOCTEXT("WyVehicleTextures", "Stale", "{0} 项的材质、字段或贴图已变化，请刷新列表。"), FText::AsNumber(Stale));
     return FText::GetEmpty();

@@ -39,6 +39,7 @@ constexpr DWORD TangentChunk = 0x57595431;
 constexpr DWORD MaterialChunk = 0x57594D31;
 constexpr wchar_t ColliderModeProperty[] = L"WY.BodyColliderMode";
 constexpr wchar_t ColliderHeightProperty[] = L"WY.BodyColliderWorldZCm";
+constexpr wchar_t ColliderSimplificationProperty[] = L"WY.BodyColliderSimplification";
 const std::pair<const char *, const wchar_t *> VehicleFieldKeys[] = {
     {"type", L"WY.VehicleType"}, {"name", L"WY.VehicleName"}, {"variant", L"WY.VariantName"}};
 std::uint64_t selectionEpoch = 1;
@@ -1955,6 +1956,12 @@ nlohmann::json WyReadSceneContext()
     MainThread();
     return {{"vehicle", ReadFields()}, {"scale", Cm()}, {"time", GetCOREInterface()->GetTime()}};
 }
+nlohmann::json WyColliderBuildSettings::HullParameters() const
+{
+    return {{"maxHullVertices", maxHullVertices}, {"degenerateEdgeTolerance", degenerateEdgeTolerance},
+            {"skipAtHullDistanceAbsolute", skipAtHullDistanceAbsolute},
+            {"skipAtHullDistanceAsFraction", skipAtHullDistanceAsFraction}};
+}
 WyColliderBuildSettings WyReadColliderBuildSettings()
 {
     MainThread();
@@ -1963,6 +1970,22 @@ WyColliderBuildSettings WyReadColliderBuildSettings()
     const auto height = Json::parse(SceneTextProperty(ColliderHeightProperty).value_or(""), nullptr, false);
     if (height.is_number() && std::isfinite(height.get<double>()))
         settings.worldZCm = height.get<double>();
+    const auto saved = Json::parse(SceneTextProperty(ColliderSimplificationProperty).value_or(""), nullptr, false);
+    if (saved.is_object())
+    {
+        const auto vertices = saved.find("maxHullVertices");
+        if (vertices != saved.end() && vertices->is_number() && settings.ValidMaxHullVertices(vertices->get<double>()))
+            settings.maxHullVertices = vertices->get<std::int32_t>();
+        const auto loadTolerance = [&](const char *name, double &target)
+        {
+            const auto it = saved.find(name);
+            if (it != saved.end() && it->is_number() && settings.ValidHullTolerance(it->get<double>()))
+                target = it->get<double>();
+        };
+        loadTolerance("degenerateEdgeTolerance", settings.degenerateEdgeTolerance);
+        loadTolerance("skipAtHullDistanceAbsolute", settings.skipAtHullDistanceAbsolute);
+        loadTolerance("skipAtHullDistanceAsFraction", settings.skipAtHullDistanceAsFraction);
+    }
     return settings;
 }
 void WyWriteScene(const nlohmann::json &items, const WySceneCall &commit, const WyColliderBuildSettings *buildSettings)
@@ -2029,6 +2052,7 @@ void WyWriteScene(const nlohmann::json &items, const WySceneCall &commit, const 
         if (buildSettings)
         {
             SceneTextFields fields{{ColliderModeProperty, buildSettings->split ? L"split" : L"single"}};
+            fields.emplace(ColliderSimplificationProperty, Wide(buildSettings->HullParameters().dump()));
             if (buildSettings->worldZCm)
                 fields.emplace(ColliderHeightProperty, Wide(Json(*buildSettings->worldZCm).dump()));
             SetSceneTextFields(std::move(fields));

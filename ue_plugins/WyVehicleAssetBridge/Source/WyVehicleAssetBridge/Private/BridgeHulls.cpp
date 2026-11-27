@@ -2,6 +2,7 @@
 #include "CompGeom/ConvexHull3.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "PhysicsEngine/SkeletalBodySetup.h"
+#include "Misc/ScopedSlowTask.h"
 #include "Misc/SecureHash.h"
 
 namespace WyHullCore
@@ -78,12 +79,55 @@ static bool ReadPart(const TSharedPtr<FJsonValue> &Value, FPart &Out, bool Expec
     return true;
 }
 
-static TSharedPtr<FJsonObject> MakeHull(const TCHAR *Name, const TSet<FVector> &Unique)
+using FHullSettings = UE::Geometry::TConvexHullSimplificationSettings<double>;
+// Preserve the threshold used for Max's float coordinates before these settings were exposed.
+static constexpr double DefaultDistanceFraction = 2.e-7;
+
+static bool ReadSimplification(const FObject &Settings, FHullSettings &Out, FString &Error)
+{
+    Out.SkipAtHullDistanceAsFraction = DefaultDistanceFraction;
+    if (Settings->HasField(TEXT("maxHullVertices")))
+    {
+        double Value;
+        if (!Settings->HasTypedField<EJson::Number>(TEXT("maxHullVertices")) ||
+            !Settings->TryGetNumberField(TEXT("maxHullVertices"), Value) || !FMath::IsFinite(Value) ||
+            Value < MIN_int32 || Value > MAX_int32 || FMath::FloorToDouble(Value) != Value ||
+            (Value > 0 && Value < 4))
+        {
+            Error = TEXT("每个凸包的最大顶点数必须是 32 位整数。非正值表示不限，正值至少为 4。");
+            return false;
+        }
+        Out.MaxHullVertices = static_cast<int32>(Value);
+    }
+    auto ReadTolerance = [&](const TCHAR *Field, const TCHAR *Label, double &Target)
+    {
+        if (!Settings->HasField(Field))
+            return true;
+        if (!Settings->HasTypedField<EJson::Number>(Field) || !Settings->TryGetNumberField(Field, Target) ||
+            !FMath::IsFinite(Target) || Target < 0)
+        {
+            Error = FString::Printf(TEXT("%s必须是大于等于 0 的有限数值。"), Label);
+            return false;
+        }
+        return true;
+    };
+    if (!ReadTolerance(TEXT("degenerateEdgeTolerance"), TEXT("最短边容差"), Out.DegenerateEdgeTolerance) ||
+        !ReadTolerance(TEXT("skipAtHullDistanceAbsolute"), TEXT("绝对距离阈值"), Out.SkipAtHullDistanceAbsolute) ||
+        !ReadTolerance(TEXT("skipAtHullDistanceAsFraction"), TEXT("相对距离阈值"), Out.SkipAtHullDistanceAsFraction))
+        return false;
+    // GeometryCore uses a negative sentinel to disable its absolute plane-distance check.
+    if (Out.SkipAtHullDistanceAbsolute == 0)
+        Out.SkipAtHullDistanceAbsolute = FHullSettings{}.SkipAtHullDistanceAbsolute;
+    return true;
+}
+
+static TSharedPtr<FJsonObject> MakeHull(const TCHAR *Name, const TSet<FVector> &Unique, const FHullSettings &Settings,
+                                       FScopedSlowTask &Progress)
 {
     if (Unique.Num() < 4)
         return nullptr;
     // Max Point3 stores floats. Solve on the positions the receiving mesh can
-    // actually represent, while evaluating containment against the full input.
+    // actually represent.
     TSet<FVector> Representable;
     Representable.Reserve(Unique.Num());
     for (const FVector &Source : Unique)
@@ -92,19 +136,36 @@ static TSharedPtr<FJsonObject> MakeHull(const TCHAR *Name, const TSet<FVector> &
     if (Points.Num() < 4)
         return nullptr;
     UE::Geometry::TConvexHull3<double> Hull;
-    Hull.SimplificationSettings.SkipAtHullDistanceAsFraction = 2.e-7;
+    Hull.SimplificationSettings = Settings;
     if (!Hull.Solve(Points.Num(), [&](int32 I) { return Points[I]; }) || Hull.GetDimension() != 3)
         return nullptr;
 
+    TSet<FVector> HullPoints;
+    for (const auto &Tri : Hull.GetTriangles())
+    {
+        HullPoints.Add(Points[Tri.A]);
+        HullPoints.Add(Points[Tri.B]);
+        HullPoints.Add(Points[Tri.C]);
+    }
+    if (HullPoints.Num() < 4 || (Settings.MaxHullVertices > 0 && HullPoints.Num() > Settings.MaxHullVertices))
+        return nullptr;
+
+    // The mean of the original cloud can lie outside an intentionally simplified hull.
     FVector Interior = FVector::ZeroVector;
     FBox Bounds(ForceInit);
-    for (const auto &Point : Points)
+    for (const auto &Point : HullPoints)
     {
         Interior += Point;
         Bounds += Point;
     }
-    Interior /= Points.Num();
+    Interior /= HullPoints.Num();
     const double Tolerance = FMath::Max(1.e-6, Bounds.GetSize().Size() * 2.e-6);
+    // UE simplification skips exterior points. Check convexity against the output in
+    // that case; the default and tighter settings also check coverage of the original input.
+    const bool bCanSkipSurface = (Settings.MaxHullVertices > 0 && Settings.MaxHullVertices < Points.Num()) ||
+        Settings.DegenerateEdgeTolerance > 0 || Settings.SkipAtHullDistanceAbsolute > 0 ||
+        Settings.SkipAtHullDistanceAsFraction > DefaultDistanceFraction;
+    const TSet<FVector> &ContainmentPoints = bCanSkipSurface ? HullPoints : Unique;
     TMap<FIntPoint, FIntPoint> Edges;
     TMap<int32, int32> VertexIds;
     FJsonValues Vertices, Faces;
@@ -117,8 +178,11 @@ static TSharedPtr<FJsonObject> MakeHull(const TCHAR *Name, const TSet<FVector> &
         VertexIds.Add(SourceIndex, NewIndex);
         return NewIndex;
     };
+    int32 FaceIndex = 0;
     for (const auto &Tri : Hull.GetTriangles())
     {
+        if ((FaceIndex++ % 64) == 0)
+            Progress.TickProgress();
         int32 Ids[3] = {Tri.A, Tri.B, Tri.C};
         const FVector &A = Points[Ids[0]];
         FVector Normal;
@@ -130,7 +194,7 @@ static TSharedPtr<FJsonObject> MakeHull(const TCHAR *Name, const TSet<FVector> &
             Swap(Ids[1], Ids[2]);
             Normal = -Normal;
         }
-        for (const auto &P : Unique)
+        for (const auto &P : ContainmentPoints)
             if (FVector::DotProduct(Normal, P - A) > Tolerance)
                 return nullptr;
         for (int32 J = 0; J < 3; ++J)
@@ -206,12 +270,16 @@ static bool ReadWorldZ(const FObject &Settings, FSplitPlane &Plane)
     return Plane.Axis[Plane.DominantAxis] != 0;
 }
 
-static FObject Build(const FJsonValues &PartsInput, const TOptional<FSplitPlane> &Plane)
+static FObject Build(const FJsonValues &PartsInput, const TOptional<FSplitPlane> &Plane,
+                     const FHullSettings &Settings)
 {
+    FScopedSlowTask Progress(4.f, NSLOCTEXT("WyVehicleHulls", "Build", "构建车身凸包"));
+    const float WorkPerPart = 1.f / FMath::Max(1, PartsInput.Num());
     TArray<FPart> Parts;
     double MinZ = TNumericLimits<double>::Max(), MaxZ = TNumericLimits<double>::Lowest();
     for (const auto &V : PartsInput)
     {
+        Progress.EnterProgressFrame(WorkPerPart, NSLOCTEXT("WyVehicleHulls", "ReadParts", "读取 LOD0 网格"));
         FPart P;
         if (!ReadPart(V, P, true))
             return HullError(TEXT("Invalid mesh or triangle indices"));
@@ -234,6 +302,9 @@ static FObject Build(const FJsonValues &PartsInput, const TOptional<FSplitPlane>
         return HullError(TEXT("切面高度必须位于车身最低点和最高点之间。"));
     TSet<FVector> Body, Spoiler, Upper, Lower;
     for (const FPart &P : Parts)
+    {
+        Progress.EnterProgressFrame(WorkPerPart, FText::Format(
+            NSLOCTEXT("WyVehicleHulls", "CollectPoints", "收集 {0} 的凸包顶点"), FText::FromString(P.Name)));
         for (const FIntVector &Face : P.Faces)
             for (int K = 0; K < 3; ++K)
             {
@@ -262,20 +333,24 @@ static FObject Build(const FJsonValues &PartsInput, const TOptional<FSplitPlane>
                     Lower.Add(Intersection);
                 }
             }
+    }
     FJsonValues Hulls;
-    auto Add = [&](const TCHAR *Name, const TSet<FVector> &Points)
+    const int32 HullCount = (Plane.IsSet() ? 2 : 1) + (Spoiler.IsEmpty() ? 0 : 1);
+    auto Add = [&](const TCHAR *Name, const TSet<FVector> &Points, const FText &Message)
     {
-        const auto Hull = MakeHull(Name, Points);
+        Progress.EnterProgressFrame(2.f / HullCount, Message);
+        const auto Hull = MakeHull(Name, Points, Settings, Progress);
         if (!Hull)
             return false;
         Hulls.Add(MakeShared<FJsonValueObject>(Hull));
         return true;
     };
-    if (!Plane.IsSet() && !Add(TEXT("Body"), Body))
+    if (!Plane.IsSet() && !Add(TEXT("Body"), Body, NSLOCTEXT("WyVehicleHulls", "Body", "构建整体车身凸包")))
         return HullError(TEXT("Body has no 3D convex hull"));
-    if (Plane.IsSet() && (!Add(TEXT("BodyLower"), Lower) || !Add(TEXT("BodyUpper"), Upper)))
+    if (Plane.IsSet() && (!Add(TEXT("BodyLower"), Lower, NSLOCTEXT("WyVehicleHulls", "Lower", "构建车身下层凸包")) ||
+                          !Add(TEXT("BodyUpper"), Upper, NSLOCTEXT("WyVehicleHulls", "Upper", "构建车身上层凸包"))))
         return HullError(TEXT("Body half has no 3D convex hull"));
-    if (!Spoiler.IsEmpty() && !Add(TEXT("Spoiler"), Spoiler))
+    if (!Spoiler.IsEmpty() && !Add(TEXT("Spoiler"), Spoiler, NSLOCTEXT("WyVehicleHulls", "Spoiler", "构建尾翼凸包")))
         return HullError(TEXT("Spoiler has no 3D convex hull"));
     auto R = MakeShared<FJsonObject>();
     R->SetBoolField(TEXT("ok"), true);
@@ -296,6 +371,10 @@ TSharedPtr<FJsonObject> WyBuildVehicleHulls(const TSharedPtr<FJsonObject> &Reque
     FString Mode;
     if (!(*Settings)->TryGetStringField(TEXT("mode"), Mode) || (Mode != TEXT("single") && Mode != TEXT("split")))
         return HullError(TEXT("Invalid hull settings"));
+    FHullSettings Simplification;
+    FString Error;
+    if (!ReadSimplification(Settings->ToSharedRef(), Simplification, Error))
+        return HullError(Error);
     FSplitPlane Split;
     if (!ReadWorldZ(Settings->ToSharedRef(), Split))
         return HullError(TEXT("场景高度变换（worldZ）需要四个有限数值及非零的 Z 轴投影。"));
@@ -345,7 +424,7 @@ TSharedPtr<FJsonObject> WyBuildVehicleHulls(const TSharedPtr<FJsonObject> &Reque
         Part->SetArrayField(TEXT("faces"), *Triangles);
         Parts.Add(MakeShared<FJsonValueObject>(Part));
     }
-    auto Built = Build(Parts, Cut);
+    auto Built = Build(Parts, Cut, Simplification);
     if (!Built->GetBoolField(TEXT("ok")))
         return Built;
     FJsonValues Shapes;
@@ -368,6 +447,7 @@ TSharedPtr<FJsonObject> WyBuildVehicleHulls(const TSharedPtr<FJsonObject> &Reque
     Item->SetObjectField(TEXT("data"), Data);
     auto Result = MakeShared<FJsonObject>();
     Result->SetBoolField(TEXT("ok"), true);
+    Result->SetBoolField(TEXT("hullSimplification"), true);
     Result->SetArrayField(TEXT("items"), {MakeShared<FJsonValueObject>(Item)});
     if (Cut.IsSet())
         Result->SetNumberField(TEXT("splitZ"), Cut->WorldHeight);

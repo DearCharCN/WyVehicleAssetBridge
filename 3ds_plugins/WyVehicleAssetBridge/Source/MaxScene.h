@@ -1,5 +1,8 @@
 #pragma once
+#include <cmath>
+#include <cstdint>
 #include <functional>
+#include <limits>
 #include <optional>
 #include <nlohmann/json.hpp>
 
@@ -24,6 +27,19 @@ struct WyColliderBuildSettings
 {
     bool split = false;
     std::optional<double> worldZCm;
+    std::int32_t maxHullVertices = -1;
+    double degenerateEdgeTolerance = 0;
+    double skipAtHullDistanceAbsolute = 0;
+    double skipAtHullDistanceAsFraction = 2.e-7;
+
+    static bool ValidMaxHullVertices(double value)
+    {
+        return value >= std::numeric_limits<std::int32_t>::min() && value <= std::numeric_limits<std::int32_t>::max() &&
+               value == std::trunc(value) && (value <= 0 || value >= 4);
+    }
+    static bool ValidHullTolerance(double value) { return std::isfinite(value) && value >= 0; }
+
+    nlohmann::json HullParameters() const;
 };
 WyColliderBuildSettings WyReadColliderBuildSettings();
 void WyWriteScene(const nlohmann::json &items, const WySceneCall &commit, const WyColliderBuildSettings *buildSettings = nullptr);

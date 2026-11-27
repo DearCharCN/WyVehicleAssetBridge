@@ -624,7 +624,10 @@ void WyBridgeClient::BuildCollider(const WyColliderBuildSettings& settings, cons
     Connect(task);
     task.report(L"正在读取 LOD0 碰撞源网格…");
     const bool split = settings.split;
-    Json hullSettings{{"mode", split ? "split" : "single"}, {"plane", split ? "manual" : "auto"}};
+    const Json hullParameters = settings.HullParameters();
+    Json hullSettings = hullParameters;
+    hullSettings["mode"] = split ? "split" : "single";
+    hullSettings["plane"] = split ? "manual" : "auto";
     Json worldZ;
     auto input = WyReadColliderInput(task.onMain, split ? &worldZ : nullptr);
     if (split)
@@ -635,6 +638,8 @@ void WyBridgeClient::BuildCollider(const WyColliderBuildSettings& settings, cons
     task.checkpoint();
     task.report(L"正在由 UE 构建凸包…");
     auto reply = Request({{"op", "hulls"}, {"settings", std::move(hullSettings)}, {"items", std::move(input)}}, task);
+    if (!reply.value("hullSimplification", false) && hullParameters != WyColliderBuildSettings{}.HullParameters())
+        throw std::runtime_error("当前 UE 插件未确认高级凸包参数。请更新 UE 插件后重新生成。");
     // Older UE plugins always cut along the vehicle's local Z axis.
     if (split && worldZ != Json::array({0, 0, 1, 0}) && reply.value("worldZ", Json()) != worldZ)
         throw std::runtime_error("UE 插件未确认 Max 世界 Z 切面。请更新 UE 插件后重新生成。");

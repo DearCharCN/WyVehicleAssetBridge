@@ -72,6 +72,20 @@ def bridge_test_tick(delta):
         elif command == "MESH_SKELETON":
             mesh = unreal.find_object(None, data["mesh"], type=unreal.SkeletalMesh)
             response["skeleton"] = mesh.get_editor_property("skeleton").get_path_name()
+        elif command == "VEHICLE_DRIVING_DEFAULTS":
+            blueprint = unreal.load_asset(data["blueprint"])
+            default_car = unreal.get_default_object(blueprint.generated_class())
+            response["default_ai_disabled"] = default_car.get_editor_property("auto_possess_ai") == unreal.AutoPossessAI.DISABLED
+            actors = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+            car = actors.spawn_actor_from_class(blueprint.generated_class(), unreal.Vector(), transient=True)
+            try:
+                response["ai_disabled"] = car.get_editor_property("auto_possess_ai") == unreal.AutoPossessAI.DISABLED
+                response["orbit_cameras"] = len(car.get_components_by_class(unreal.FGearOrbitCamera))
+                response["axles"] = {axle.get_name(): [axle.get_editor_property("mMaxSteerAngle"),
+                                                       axle.get_editor_property("mHasHandbrake")]
+                                     for axle in car.get_components_by_class(unreal.FGearAxle)}
+            finally:
+                actors.destroy_actor(car)
         elif command == "SET_PHYSICS_BINDINGS":
             mesh = unreal.load_asset(data["mesh"])
             physics = unreal.load_asset(data["physics"])
@@ -83,6 +97,23 @@ def bridge_test_tick(delta):
             preview = unreal.load_asset(data["physics_preview"])
             unreal.get_default_object(unreal.SystemLibrary).call_method(
                 "SetSoftObjectPropertyByName", (physics, "PreviewSkeletalMesh", preview))
+        elif command == "SKELETAL_COMPONENT_BOUNDS":
+            mesh = unreal.load_asset(data["mesh"])
+            world = unreal.get_editor_subsystem(unreal.UnrealEditorSubsystem).get_editor_world()
+            # Spawn through gameplay APIs so measuring the bounds leaves the editor undo stack intact.
+            gameplay = unreal.get_default_object(unreal.GameplayStatics)
+            transform = unreal.Transform()
+            actor = gameplay.call_method("BeginDeferredActorSpawnFromClass", (world, unreal.SkeletalMeshActor, transform))
+            try:
+                gameplay.call_method("FinishSpawningActor", (actor, transform))
+                component = actor.skeletal_mesh_component
+                component.set_skinned_asset_and_update(mesh)
+                origin, extent, _ = unreal.SystemLibrary.get_component_bounds(component)
+                response["bounds"] = [[v.x, v.y, v.z] for v in (origin, extent)]
+                imported = mesh.get_bounds()
+                response["mesh_bounds"] = [[v.x, v.y, v.z] for v in (imported.origin, imported.box_extent)]
+            finally:
+                actor.destroy_actor()
         elif command == "PHYSICS_BINDINGS":
             mesh = unreal.load_asset(data["mesh"])
             physics = unreal.load_asset(data["physics"])
@@ -96,9 +127,14 @@ def bridge_test_tick(delta):
             component.set_skinned_asset_and_update(preview or mesh)
             response["body_index"] = component.get_bone_index("Body")
             response["body_parent"] = str(component.get_parent_bone("Body"))
-            response["hulls"] = {str(body.get_editor_property("bone_name")):
-                                 len(body.get_editor_property("agg_geom").get_editor_property("convex_elems"))
-                                 for body in unreal.ObjectIterator(unreal.BodySetup) if body.get_outer() == physics}
+            bodies = {str(body.get_editor_property("bone_name")): body
+                      for body in unreal.ObjectIterator(unreal.BodySetup) if body.get_outer() == physics}
+            response["hulls"] = {name: len(body.get_editor_property("agg_geom").get_editor_property("convex_elems"))
+                                 for name, body in bodies.items()}
+            body = bodies["Body"]
+            response["body_simulated"] = body.get_editor_property("physics_type") == unreal.PhysicsType.PHYS_TYPE_SIMULATED
+            response["simple_as_complex"] = (body.get_editor_property("collision_trace_flag") ==
+                                             unreal.CollisionTraceFlag.CTF_USE_SIMPLE_AS_COMPLEX)
         elif command == "MOVE_TEST_CONVEX":
             physics = unreal.load_asset(data["physics"])
             assert physics.get_outermost().get_path_name().startswith("/Game/Vehicle/SportsCar/PhysicsQA")
@@ -650,6 +686,10 @@ def check_blueprint_creation(session):
         check(not any(classes().values()), "One undo did not remove the complete vehicle")
         session.command("REDO")
         check(classes() == present, "One redo did not restore the complete vehicle")
+        driving = session.command("VEHICLE_DRIVING_DEFAULTS", blueprint=packages[0])
+        check(driving["default_ai_disabled"] and driving["ai_disabled"] and driving["orbit_cameras"] == 1 and
+              driving["axles"]["Front Axle"] == [60.0, True] and driving["axles"]["Rear Axle"][1],
+              f"Unexpected generated vehicle driving defaults: {driving}")
         check(not list(content.rglob("*.uasset")), "First creation or redo saved the vehicle")
 
 
@@ -1066,6 +1106,7 @@ def check_physics_binding(session, vehicle, hull_count):
     check(bindings["mesh_physics"] == packages["physics"] and bindings["physics_preview"] == packages["mesh"] and
           bindings["body_index"] >= 0 and bindings["body_parent"] == "Root" and bindings["hulls"] == {"Body": hull_count},
           f"Incorrect PhysicsAsset, preview mesh, or Root/Body collision binding: {bindings}")
+    check(bindings["body_simulated"] and bindings["simple_as_complex"], f"Incorrect new Body physics defaults: {bindings}")
 
 
 def run_suite(session):
@@ -1201,6 +1242,53 @@ def run_suite(session):
         check("BodyCollider" not in session.read(vehicle), "Building hulls wrote PhysicsAsset")
         check(not list((session.directory / "Content").rglob("*.uasset")), "An operation saved assets without request")
 
+    with session.case("Each advanced hull control simplifies whole, split, and spoiler hulls independently"):
+        defaults = {"maxHullVertices": -1, "degenerateEdgeTolerance": 0, "skipAtHullDistanceAbsolute": 0,
+                    "skipAtHullDistanceAsFraction": 2e-7}
+        for mode, names in [({"mode": "single"}, {"Body", "Spoiler"}),
+                            ({"mode": "split", "plane": "manual", "splitZ": 3}, {"BodyLower", "BodyUpper", "Spoiler"})]:
+            def generate(**overrides):
+                reply = session.call({"op": "hulls", "settings": {**mode, **overrides}, "items": [body_input, spoiler_input]})
+                check(reply.get("hullSimplification") is True, "Missing hull simplification capability receipt")
+                shapes = {s["name"]: s for s in reply["items"][0]["data"]["shapes"]}
+                check(set(shapes) == names, f"Unexpected hulls for {mode}, {overrides}")
+                return shapes
+
+            legacy = generate()
+            check(all(len(s["positions"]) > 4 for s in legacy.values()), "Fixture must exercise simplification")
+            check(generate(**defaults) == legacy, "Explicit Max defaults changed the legacy hull")
+            for overrides in [{"maxHullVertices": 4}, {"degenerateEdgeTolerance": 100},
+                              {"skipAtHullDistanceAbsolute": 100}, {"skipAtHullDistanceAsFraction": 2},
+                              {"degenerateEdgeTolerance": sys.float_info.max},
+                              {"skipAtHullDistanceAbsolute": sys.float_info.max},
+                              {"skipAtHullDistanceAsFraction": sys.float_info.max}]:
+                for name, shape in generate(**overrides).items():
+                    check(len(shape["positions"]) == 4, f"{name} did not respond to {overrides}")
+                    verify_convex(shape, shape["positions"])
+
+            for budget in [-2147483648, 0, 2147483647]:
+                unlimited = generate(maxHullVertices=budget, skipAtHullDistanceAsFraction=0)
+                for name in names:
+                    # A positive budget can change triangulation even when it never reaches the cap.
+                    # The fixture has flat sides, which may retain different collinear points.
+                    verify_convex(unlimited[name], legacy[name]["positions"])
+                    verify_convex(legacy[name], unlimited[name]["positions"])
+        assert_protected(after_batch, session.read(vehicle))
+
+    with session.case("Advanced hull settings reject invalid numbers before returning any geometry"):
+        invalid = {"maxHullVertices": [-2147483649, 1, 2, 3, 4.5, 2147483648, "4", True, None],
+                   "degenerateEdgeTolerance": [-1, "0.1", True, None],
+                   "skipAtHullDistanceAbsolute": [-1, "0", True, None],
+                   "skipAtHullDistanceAsFraction": [-0.1, "0.001", False, None]}
+        for field, values in invalid.items():
+            for value in values:
+                rejected = session.call({"op": "hulls", "settings": {"mode": "single", field: value},
+                                         "items": [body_input]}, success=False)
+                check(rejected.get("ok") is False and "items" not in rejected and rejected.get("error"),
+                      f"Invalid hull setting accepted: {field}={value!r}")
+                check(field not in rejected["error"], f"Protocol field name leaked into the UI error: {rejected['error']}")
+        assert_protected(after_batch, session.read(vehicle))
+
     with session.case("Whole and split collision include door windows and door panels and exclude the Mirror family"):
         settings = {"mode": "split", "plane": "manual", "splitZ": 3}
         door_shape = concave_prism(offset=(-20, 0, 0))
@@ -1300,14 +1388,21 @@ def run_suite(session):
         assert_protected(after_batch, {key: value for key, value in after_physics.items() if key != "BodyCollider"})
         written = after_physics["BodyCollider"]["data"]["shapes"]
         check_physics_binding(session, vehicle, 1)
+        mesh_path = physics_packages(vehicle)["mesh"]
+        # The fixture prism spans (0, 0, 0) to (20, 20, 8) cm, with Body in its reference pose.
+        hull_bounds = [[10, 10, 4], [10, 10, 4]]
+        near(session.command("SKELETAL_COMPONENT_BOUNDS", mesh=mesh_path)["bounds"], hull_bounds, "synced physics bounds")
         check(len(written) == 1 and written[0]["name"] == body_shape["name"], "Collision group name/count changed")
         verify_convex(written[0], body_shape["positions"])
         check(len(written[0]["positions"]) < len(body_shape["positions"]), "Concave vertices were not converted to a convex hull")
         session.command("UNDO")
         assert_protected(after_batch, session.read(vehicle))
+        undone = session.command("SKELETAL_COMPONENT_BOUNDS", mesh=mesh_path)
+        near(undone["bounds"], undone["mesh_bounds"], "bounds after undoing collision creation")
         session.command("REDO")
         assert_protected(after_physics, session.read(vehicle))
         check_physics_binding(session, vehicle, 1)
+        near(session.command("SKELETAL_COMPONENT_BOUNDS", mesh=mesh_path)["bounds"], hull_bounds, "redone physics bounds")
         check(not list((session.directory / "Content").rglob("*.uasset")), "Bridge unexpectedly saved packages")
 
     with session.case("Closed editable convex faces survive Chaos cooking and live UE edits still change the revision"):

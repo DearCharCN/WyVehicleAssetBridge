@@ -5,12 +5,13 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/Blueprint.h"
+#include "Engine/BlueprintGeneratedClass.h"
 #include "Engine/CollisionProfile.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
-#include "GameFramework/Actor.h"
+#include "GameFramework/Pawn.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "MeshDescription.h"
 #include "UObject/Package.h"
@@ -38,7 +39,13 @@ constexpr const TCHAR* WheelOptions[] = {TEXT("Front Wheel Options"), TEXT("Rear
 // native defaults by reflection also lets the bridge editor module load in an empty project.
 struct FVehicleDefaults
 {
+    APawn* Pawn = nullptr;
     USkeletalMeshComponent* Mesh = nullptr;
+    UClass* OrbitCameraClass = nullptr;
+    UObject* FrontAxle = nullptr;
+    UObject* RearAxle = nullptr;
+    FFloatProperty* MaxSteerAngle = nullptr;
+    FBoolProperty* HasHandbrake = nullptr;
     UObject* Wheel[UE_ARRAY_COUNT(Wheels)]{};
     UObject* Options[UE_ARRAY_COUNT(WheelOptions)]{};
     FNameProperty* BoneName = nullptr;
@@ -47,15 +54,15 @@ struct FVehicleDefaults
 
     bool Read(UClass* Class, FString& Error)
     {
-        AActor* CDO = Class ? Class->GetDefaultObject<AActor>() : nullptr;
-        if (!CDO)
+        Pawn = Class ? Class->GetDefaultObject<APawn>() : nullptr;
+        if (!Pawn)
         {
-            Error = TEXT("无法读取车辆类的默认 Actor。");
+            Error = TEXT("无法读取车辆类的默认 Pawn。");
             return false;
         }
         const auto Component = [&](const TCHAR* Name, const TCHAR* ClassPath) -> UObject*
         {
-            UObject* Object = CDO->GetDefaultSubobjectByName(FName(Name));
+            UObject* Object = Pawn->GetDefaultSubobjectByName(FName(Name));
             UClass* ComponentClass = FindObject<UClass>(nullptr, ClassPath);
             if (!Object || !ComponentClass || !Object->IsA(ComponentClass))
             {
@@ -68,6 +75,23 @@ struct FVehicleDefaults
         Mesh = Cast<USkeletalMeshComponent>(Component(TEXT("Mesh Component"), TEXT("/Script/FGearPlugin.FGearSkeletalMeshComponent")));
         if (!Mesh)
             return false;
+        OrbitCameraClass = FindObject<UClass>(nullptr, TEXT("/Script/FGearPlugin.FGearOrbitCamera"));
+        if (!OrbitCameraClass || !OrbitCameraClass->IsChildOf(USceneComponent::StaticClass()) || OrbitCameraClass->HasAnyClassFlags(CLASS_Abstract))
+        {
+            Error = TEXT("无法创建 FGearOrbitCamera 环绕相机组件。");
+            return false;
+        }
+        FrontAxle = Component(TEXT("Front Axle"), TEXT("/Script/FGearPlugin.FGearAxle"));
+        RearAxle = Component(TEXT("Rear Axle"), TEXT("/Script/FGearPlugin.FGearAxle"));
+        if (!FrontAxle || !RearAxle)
+            return false;
+        MaxSteerAngle = FindFProperty<FFloatProperty>(FrontAxle->GetClass(), TEXT("mMaxSteerAngle"));
+        HasHandbrake = FindFProperty<FBoolProperty>(FrontAxle->GetClass(), TEXT("mHasHandbrake"));
+        if (!MaxSteerAngle || !HasHandbrake)
+        {
+            Error = TEXT("FGear 车轴缺少最大转向角或手刹属性。");
+            return false;
+        }
         for (int32 I = 0; I < UE_ARRAY_COUNT(Wheels); ++I)
         {
             Wheel[I] = Component(Wheels[I].Component, TEXT("/Script/FGearPlugin.FGearWheel"));
@@ -169,6 +193,17 @@ bool WyCreateVehicleBlueprint(UPackage* Outer, FName Name, UClass* ParentClass, 
     if (!Defaults.Read(OutBlueprint->GeneratedClass, Error))
         return false;
     USimpleConstructionScript* SCS = OutBlueprint->SimpleConstructionScript;
+    if (!AActor::GetActorClassDefaultComponent(ParentClass, Defaults.OrbitCameraClass))
+    {
+        USCS_Node* CameraNode = SCS->CreateNode(Defaults.OrbitCameraClass, TEXT("FGearOrbitCamera"));
+        if (!CameraNode)
+        {
+            Error = TEXT("车辆蓝图未能建立 FGearOrbitCamera 环绕相机组件。");
+            return false;
+        }
+        CameraNode->SetParent(Defaults.Mesh);
+        SCS->AddNode(CameraNode);
+    }
     for (const FWheelBinding& Wheel : Wheels)
     {
         const FReferenceSkeleton& Skeleton = Mesh->GetRefSkeleton();
@@ -209,6 +244,13 @@ bool WyCreateVehicleBlueprint(UPackage* Outer, FName Name, UClass* ParentClass, 
     // native component defaults on the final child CDO, never the parent's CDO.
     if (!Defaults.Read(OutBlueprint->GeneratedClass, Error))
         return false;
+    Defaults.Pawn->Modify();
+    Defaults.Pawn->AutoPossessAI = EAutoPossessAI::Disabled;
+    Defaults.FrontAxle->Modify();
+    Defaults.RearAxle->Modify();
+    Defaults.MaxSteerAngle->SetPropertyValue_InContainer(Defaults.FrontAxle, 60.f);
+    Defaults.HasHandbrake->SetPropertyValue_InContainer(Defaults.FrontAxle, true);
+    Defaults.HasHandbrake->SetPropertyValue_InContainer(Defaults.RearAxle, true);
     Defaults.Mesh->Modify();
     Defaults.Mesh->SetSkeletalMesh(Mesh);
     Defaults.Mesh->SetAnimInstanceClass(Anim->GeneratedClass);
@@ -223,5 +265,8 @@ bool WyCreateVehicleBlueprint(UPackage* Outer, FName Name, UClass* ParentClass, 
         Defaults.Radius->SetPropertyValue_InContainer(Options, RadiusMeters);
         Defaults.Width->SetPropertyValue_InContainer(Options, WidthMeters);
     }
+    // A freshly spawned pawn only copies inherited native properties listed by the generated class.
+    // The last compile built that list before AutoPossessAI was changed on its CDO.
+    CastChecked<UBlueprintGeneratedClass>(OutBlueprint->GeneratedClass)->UpdateCustomPropertyListForPostConstruction();
     return true;
 }

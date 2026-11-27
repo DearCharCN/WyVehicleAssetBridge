@@ -81,8 +81,36 @@ enum Control : int
     ColliderError,
     ColliderModeLabel,
     ColliderHeightLabel,
-    ColliderDragHint
+    ColliderDragHint,
+    ColliderAdvanced,
+    ColliderMaxVertices,
+    ColliderEdgeTolerance,
+    ColliderAbsoluteDistance,
+    ColliderRelativeDistance,
+    ColliderMaxVerticesLabel,
+    ColliderEdgeToleranceLabel,
+    ColliderAbsoluteDistanceLabel,
+    ColliderRelativeDistanceLabel
 };
+struct HullField
+{
+    Control input, label;
+    const wchar_t* caption;
+};
+constexpr HullField HullFields[] = {
+    {ColliderMaxVertices, ColliderMaxVerticesLabel, L"每个凸包的最大顶点数"},
+    {ColliderEdgeTolerance, ColliderEdgeToleranceLabel, L"最短边容差（cm）"},
+    {ColliderAbsoluteDistance, ColliderAbsoluteDistanceLabel, L"绝对距离阈值（cm）"},
+    {ColliderRelativeDistance, ColliderRelativeDistanceLabel, L"相对距离阈值"}
+};
+bool IsHullInput(int id)
+{
+    return id >= ColliderMaxVertices && id <= ColliderRelativeDistance;
+}
+bool IsTextInput(int id)
+{
+    return id == VehicleType || id == VehicleName || id == VehicleVariant || id == Search || id == ColliderHeight || IsHullInput(id);
+}
 HINSTANCE Module = nullptr;
 bool Initialized = false;
 ActionTable* RegisteredActions = nullptr;
@@ -120,6 +148,16 @@ std::wstring Text(HWND control)
     const int length = GetWindowTextW(control, value.data(), static_cast<int>(value.size()));
     value.resize(static_cast<size_t>(std::max(0, length)));
     return value;
+}
+template<typename T>
+bool ReadNumber(HWND control, T& value)
+{
+    std::wistringstream stream(Text(control));
+    stream.imbue(std::locale::classic());
+    if (!(stream >> value) || !std::isfinite(value))
+        return false;
+    stream >> std::ws;
+    return stream.eof();
 }
 std::string String(const Json& object, const char* key)
 {
@@ -192,6 +230,7 @@ class Panel final
     std::wstring tooltipText_;
     HWND mode_ = nullptr, height_ = nullptr, colliderError_ = nullptr;
     bool colliderRegistered_ = false, heightEdited_ = false, heightDragPending_ = false, draggingHeight_ = false;
+    bool colliderAdvanced_ = false;
     int heightDragStartX_ = 0;
     double heightDragStartCm_ = 0.0;
     HFONT font_ = nullptr, statusFont_ = nullptr;
@@ -232,6 +271,7 @@ class Panel final
     bool DrawFormControl(const DRAWITEMSTRUCT&) const;
     void Layout();
     void LayoutColliderDialog();
+    void ResizeColliderDialog();
     void Refresh();
     void ParseSnapshot(const Json&);
     void PopulateFields();
@@ -257,8 +297,8 @@ class Panel final
     bool HandleTextFocus(WPARAM, LPARAM);
     void ReleaseTextFocus();
     void CheckTextPointer(HWND field);
-    void UpdateColliderPreview();
-    bool ReadColliderHeight(double& heightCm) const;
+    void UpdateColliderPreview(bool updatePlane = true);
+    const wchar_t* ReadHullSettings(WyColliderBuildSettings&) const;
     std::string SelectionId(size_t) const;
     int VisibleIndex(const std::string&) const;
     bool CanSync(const Node&, bool) const;
@@ -302,7 +342,7 @@ bool Panel::HandleTextFocus(WPARAM command, LPARAM source)
 {
     const int id = LOWORD(command), event = HIWORD(command);
     const bool combo = id == VehicleType;
-    if (!source || !(combo || id == VehicleName || id == VehicleVariant || id == Search || id == ColliderHeight))
+    if (!source || !IsTextInput(id))
         return false;
     const HWND field = reinterpret_cast<HWND>(source);
     if (combo && event == CBN_CLOSEUP && pendingPointerExit_ == field)
@@ -463,7 +503,7 @@ HWND Panel::ControlWindow(const wchar_t* type, const wchar_t* caption, DWORD sty
     if (control)
     {
         SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(font_), TRUE);
-        if (id == VehicleType || id == VehicleName || id == VehicleVariant || id == Search || id == ColliderHeight)
+        if (IsTextInput(id))
         {
             const auto field = reinterpret_cast<UINT_PTR>(control);
             const auto panel = reinterpret_cast<DWORD_PTR>(this);
@@ -673,10 +713,12 @@ bool Panel::DrawFormControl(const DRAWITEMSTRUCT& item) const
     }
     const bool button = item.CtlType == ODT_BUTTON &&
                         (item.CtlID == Reconnect || item.CtlID == ApplyFields || item.CtlID == RefreshButton ||
-                         item.CtlID == CreateAll || item.CtlID == ColliderCancel || item.CtlID == ColliderGenerate);
+                         item.CtlID == CreateAll || item.CtlID == ColliderCancel || item.CtlID == ColliderGenerate ||
+                         item.CtlID == ColliderAdvanced);
     const bool label = item.CtlType == ODT_STATIC &&
                        ((item.CtlID >= 2001 && item.CtlID <= 2003) || item.CtlID == TargetPath || item.CtlID == ProjectPath ||
-                        (item.CtlID >= ColliderError && item.CtlID <= ColliderDragHint));
+                        (item.CtlID >= ColliderError && item.CtlID <= ColliderDragHint) ||
+                        (item.CtlID >= ColliderMaxVerticesLabel && item.CtlID <= ColliderRelativeDistanceLabel));
     if (!button && !label)
         return false;
 
@@ -1309,12 +1351,17 @@ void Panel::BuildCollision()
     WyColliderBuildSettings options;
     options.split = SendMessageW(mode_, CB_GETCURSEL, 0, 0) == 1;
     double heightCm;
-    if (heightEdited_ && ReadColliderHeight(heightCm))
+    if (heightEdited_ && ReadNumber(height_, heightCm))
         options.worldZCm = heightCm;
     if (options.split && !options.worldZCm)
     {
         UpdateColliderPreview();
         SetFocus(height_);
+        return;
+    }
+    if (const auto* error = ReadHullSettings(options))
+    {
+        SetWindowTextW(colliderError_, error);
         return;
     }
     // Read live Max state now: a manual child may have been added since Refresh.
@@ -1825,13 +1872,32 @@ void Panel::CloseColliderDialog()
     if (colliderWindow_)
         DestroyWindow(colliderWindow_);
 }
+void Panel::ResizeColliderDialog()
+{
+    const bool split = SendMessageW(mode_, CB_GETCURSEL, 0, 0) == 1;
+    RECT size{0, 0, Scale(390),
+              Scale((split ? 108 : 52) + 104 + (colliderAdvanced_ ? 34 * static_cast<int>(std::size(HullFields)) : 0))};
+    AdjustWindowRectExForDpi(&size, static_cast<DWORD>(GetWindowLongPtrW(colliderWindow_, GWL_STYLE)), FALSE,
+                             static_cast<DWORD>(GetWindowLongPtrW(colliderWindow_, GWL_EXSTYLE)), dpi_);
+    const int w = size.right - size.left, h = size.bottom - size.top;
+    RECT current{};
+    GetWindowRect(colliderWindow_, &current);
+    int x = current.left, y = current.top;
+    MONITORINFO monitor{sizeof(monitor)};
+    if (GetMonitorInfoW(MonitorFromWindow(colliderWindow_, MONITOR_DEFAULTTONEAREST), &monitor))
+    {
+        x = std::clamp<LONG>(x, monitor.rcWork.left, std::max(monitor.rcWork.left, monitor.rcWork.right - w));
+        y = std::clamp<LONG>(y, monitor.rcWork.top, std::max(monitor.rcWork.top, monitor.rcWork.bottom - h));
+    }
+    SetWindowPos(colliderWindow_, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
 void Panel::LayoutColliderDialog()
 {
     if (!colliderWindow_)
         return;
     RECT bounds{};
     GetClientRect(colliderWindow_, &bounds);
-    const int width = bounds.right, height = bounds.bottom, pad = Scale(14), inputX = Scale(126);
+    const int width = bounds.right, height = bounds.bottom, pad = Scale(14), inputX = Scale(172);
     const auto move = [&](int id, int x, int y, int w, int h)
     { MoveWindow(GetDlgItem(colliderWindow_, id), x, y, std::max(1, w), h, TRUE); };
     move(ColliderModeLabel, pad, pad + Scale(3), inputX - pad, Scale(24));
@@ -1839,21 +1905,44 @@ void Panel::LayoutColliderDialog()
     move(ColliderHeightLabel, pad, Scale(56), inputX - pad, Scale(24));
     move(ColliderHeight, inputX, Scale(52), width - inputX - pad, Scale(26));
     move(ColliderDragHint, inputX, Scale(82), width - inputX - pad, Scale(22));
-    move(ColliderError, pad, Scale(107), width - pad * 2, Scale(30));
+    const bool split = SendMessageW(mode_, CB_GETCURSEL, 0, 0) == 1;
+    int rowY = split ? 108 : 52;
+    move(ColliderAdvanced, pad, Scale(rowY), Scale(116), Scale(26));
+    rowY += 34;
+    for (const auto& field : HullFields)
+    {
+        ShowWindow(GetDlgItem(colliderWindow_, field.label), colliderAdvanced_ ? SW_SHOWNA : SW_HIDE);
+        ShowWindow(GetDlgItem(colliderWindow_, field.input), colliderAdvanced_ ? SW_SHOWNA : SW_HIDE);
+        if (colliderAdvanced_)
+        {
+            move(field.label, pad, Scale(rowY), inputX - pad - Scale(6), Scale(26));
+            move(field.input, inputX, Scale(rowY), width - inputX - pad, Scale(26));
+            rowY += 34;
+        }
+    }
+    move(ColliderError, pad, Scale(rowY), width - pad * 2, Scale(24));
     const int buttonWidth = Scale(76), buttonHeight = Scale(28), buttonY = height - pad - buttonHeight;
     move(ColliderCancel, width - pad - 2 * buttonWidth - Scale(8), buttonY, buttonWidth, buttonHeight);
     move(ColliderGenerate, width - pad - buttonWidth, buttonY, buttonWidth, buttonHeight);
 }
-bool Panel::ReadColliderHeight(double& heightCm) const
+const wchar_t* Panel::ReadHullSettings(WyColliderBuildSettings& settings) const
 {
-    std::wistringstream stream(Text(height_));
-    stream.imbue(std::locale::classic());
-    if (!(stream >> heightCm) || !std::isfinite(heightCm))
-        return false;
-    stream >> std::ws;
-    return stream.eof();
+    if (!ReadNumber(GetDlgItem(colliderWindow_, ColliderMaxVertices), settings.maxHullVertices) ||
+        !WyColliderBuildSettings::ValidMaxHullVertices(settings.maxHullVertices))
+        return L"顶点数须为 32 位整数：≤ 0 表示不限，正数至少为 4。";
+    const auto readTolerance = [&](int id, double& value)
+    {
+        return ReadNumber(GetDlgItem(colliderWindow_, id), value) && WyColliderBuildSettings::ValidHullTolerance(value);
+    };
+    if (!readTolerance(ColliderEdgeTolerance, settings.degenerateEdgeTolerance))
+        return L"最短边容差须为大于或等于 0 的有限数值。";
+    if (!readTolerance(ColliderAbsoluteDistance, settings.skipAtHullDistanceAbsolute))
+        return L"绝对距离阈值须为大于或等于 0 的有限数值。";
+    if (!readTolerance(ColliderRelativeDistance, settings.skipAtHullDistanceAsFraction))
+        return L"相对距离阈值须为大于或等于 0 的有限数值。";
+    return nullptr;
 }
-void Panel::UpdateColliderPreview()
+void Panel::UpdateColliderPreview(bool updatePlane)
 {
     if (!colliderError_)
         return;
@@ -1861,11 +1950,15 @@ void Panel::UpdateColliderPreview()
     for (int id : {ColliderHeightLabel, ColliderHeight, ColliderDragHint})
         ShowWindow(GetDlgItem(colliderWindow_, id), split ? SW_SHOWNA : SW_HIDE);
     double heightCm = 0;
-    const bool valid = !split || ReadColliderHeight(heightCm);
+    const bool valid = !split || ReadNumber(height_, heightCm);
     const bool needsHeight = split && !heightEdited_;
-    SetWindowTextW(colliderError_, !valid ? L"请输入有效的切面高度（cm）。" :
-                                   needsHeight ? L"请设置世界 Z 高度后生成。" : L"");
-    EnableWindow(GetDlgItem(colliderWindow_, ColliderGenerate), valid && !needsHeight);
+    WyColliderBuildSettings settings;
+    const wchar_t* error = !valid ? L"请输入有效的切面高度（cm）。" :
+                           needsHeight ? L"请设置世界 Z 高度后生成。" : ReadHullSettings(settings);
+    SetWindowTextW(colliderError_, error ? error : L"");
+    EnableWindow(GetDlgItem(colliderWindow_, ColliderGenerate), error == nullptr);
+    if (!updatePlane)
+        return;
     if (split && valid)
         WyShowColliderPlane(heightCm);
     else
@@ -1880,6 +1973,11 @@ LRESULT CALLBACK Panel::ColliderInputProc(HWND window, UINT message, WPARAM wPar
         panel->CloseColliderDialog();
         return 0;
     }
+    if (message == WM_KEYDOWN && wParam == VK_RETURN && (window == panel->height_ || IsHullInput(GetDlgCtrlID(window))))
+    {
+        SendMessageW(panel->colliderWindow_, WM_COMMAND, ColliderGenerate, 0);
+        return 0;
+    }
     if (window == panel->height_)
     {
         switch (message)
@@ -1888,7 +1986,7 @@ LRESULT CALLBACK Panel::ColliderInputProc(HWND window, UINT message, WPARAM wPar
         {
             // Keep the edit's caret and text entry on a click. Scrubbing starts only after a horizontal drag.
             const auto result = DefSubclassProc(window, message, wParam, lParam);
-            panel->heightDragPending_ = panel->ReadColliderHeight(panel->heightDragStartCm_);
+            panel->heightDragPending_ = ReadNumber(window, panel->heightDragStartCm_);
             panel->heightDragStartX_ = GET_X_LPARAM(lParam);
             panel->draggingHeight_ = false;
             if (panel->heightDragPending_ && GetCapture() != window)
@@ -1919,13 +2017,6 @@ LRESULT CALLBACK Panel::ColliderInputProc(HWND window, UINT message, WPARAM wPar
         case WM_CAPTURECHANGED:
             panel->heightDragPending_ = false;
             panel->draggingHeight_ = false;
-            break;
-        case WM_KEYDOWN:
-            if (wParam == VK_RETURN)
-            {
-                SendMessageW(panel->colliderWindow_, WM_COMMAND, ColliderGenerate, 0);
-                return 0;
-            }
             break;
         }
     }
@@ -1962,6 +2053,18 @@ LRESULT CALLBACK Panel::ColliderProc(HWND window, UINT message, WPARAM wParam, L
             panel->height_ = panel->ControlWindow(L"EDIT", height.c_str(), ES_AUTOHSCROLL | WS_TABSTOP,
                                                   ColliderHeight, window, WS_EX_CLIENTEDGE);
             panel->ControlWindow(L"STATIC", L"输入数值或按住数值左右拖动", SS_OWNERDRAW, ColliderDragHint, window);
+            panel->colliderAdvanced_ = false;
+            panel->ControlWindow(L"BUTTON", L"▸ 高级选项", BS_OWNERDRAW | WS_TABSTOP, ColliderAdvanced, window);
+            const std::wstring values[] = {std::to_wstring(settings.maxHullVertices),
+                                           Wide(Json(settings.degenerateEdgeTolerance).dump()),
+                                           Wide(Json(settings.skipAtHullDistanceAbsolute).dump()),
+                                           Wide(Json(settings.skipAtHullDistanceAsFraction).dump())};
+            for (size_t i = 0; i < std::size(HullFields); ++i)
+            {
+                const auto& field = HullFields[i];
+                panel->ControlWindow(L"STATIC", field.caption, SS_OWNERDRAW, field.label, window);
+                panel->ControlWindow(L"EDIT", values[i].c_str(), ES_AUTOHSCROLL | WS_TABSTOP, field.input, window, WS_EX_CLIENTEDGE);
+            }
             panel->colliderError_ = panel->ControlWindow(L"STATIC", L"", SS_OWNERDRAW, ColliderError, window);
             panel->ControlWindow(L"BUTTON", L"取消", BS_OWNERDRAW | WS_TABSTOP, ColliderCancel, window);
             panel->ControlWindow(L"BUTTON", L"生成", BS_OWNERDRAW | WS_TABSTOP, ColliderGenerate, window);
@@ -1971,7 +2074,7 @@ LRESULT CALLBACK Panel::ColliderProc(HWND window, UINT message, WPARAM wParam, L
             }, reinterpret_cast<LPARAM>(panel));
             panel->heightEdited_ = settings.worldZCm.has_value();
             panel->UpdateColliderPreview();
-            panel->LayoutColliderDialog();
+            panel->ResizeColliderDialog();
             return 0;
         }
         case WM_MEASUREITEM:
@@ -2001,10 +2104,24 @@ LRESULT CALLBACK Panel::ColliderProc(HWND window, UINT message, WPARAM wParam, L
                 panel->CloseColliderDialog();
                 return 0;
             }
+            if (id == ColliderAdvanced && event == BN_CLICKED)
+            {
+                panel->colliderAdvanced_ = !panel->colliderAdvanced_;
+                SetWindowTextW(GetDlgItem(window, ColliderAdvanced), panel->colliderAdvanced_ ? L"▾ 高级选项" : L"▸ 高级选项");
+                panel->ResizeColliderDialog();
+                return 0;
+            }
+            if (IsHullInput(id) && event == EN_CHANGE)
+            {
+                panel->UpdateColliderPreview(false);
+                return 0;
+            }
             if ((id == ColliderMode && event == CBN_SELCHANGE) || (id == ColliderHeight && event == EN_CHANGE))
             {
                 if (id == ColliderHeight)
                     panel->heightEdited_ = true;
+                else
+                    panel->ResizeColliderDialog();
                 panel->UpdateColliderPreview();
                 return 0;
             }
@@ -2022,7 +2139,7 @@ LRESULT CALLBACK Panel::ColliderProc(HWND window, UINT message, WPARAM wParam, L
             return 0;
         case WM_DESTROY:
             WyHideColliderPlane();
-            if (panel->acceleratorOwner_ == panel->height_)
+            if (panel->acceleratorOwner_ && IsChild(window, panel->acceleratorOwner_))
                 panel->ReleaseTextFocus();
             if (panel->colliderRegistered_)
             {

@@ -5,6 +5,7 @@
 #include "ContentBrowserModule.h"
 #include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "IContentBrowserSingleton.h"
+#include "Misc/ScopedSlowTask.h"
 #include "Modules/ModuleManager.h"
 #include "Styling/StyleColors.h"
 #include "ThumbnailRendering/ThumbnailManager.h"
@@ -216,6 +217,8 @@ TSharedRef<ITableRow> SWyVehicleTexturePanel::GenerateRow(FRowPtr Item, const TS
 
 FReply SWyVehicleTexturePanel::Refresh()
 {
+    FScopedSlowTask Progress(0.f, LOCTEXT("RefreshTextures", "刷新载具材质贴图"));
+    Progress.MakeDialogDelayed(0.35f);
     UpdateFromBrowser(true);
     return FReply::Handled();
 }
